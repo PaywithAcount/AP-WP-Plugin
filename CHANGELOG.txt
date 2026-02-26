@@ -1,0 +1,17 @@
+*** AcountPay Payment Gateway Changelog ***
+
+2025-02-24 - version 2.0.0
+* Added - Extension flow: pay with Client ID only (no API key required)
+* Added - Redirect to AcountPay to select bank (bank selection on AcountPay, not in checkout)
+* Added - Single Client ID setting for both test and live
+* Update - Payment link (v2) creates payment and returns redirect to AcountPay; callback URL for return after payment
+* Fixed - Changelog format for WooCommerce Marketplace
+
+2024-01-01 - version 1.0.0
+* Added - Initial release of AcountPay Payment Gateway for WooCommerce
+* Added - Support for classic and block-based WooCommerce checkout
+* Added - Bank selection with dynamic bank list loading
+* Added - Payment intent creation and management
+* Added - Test and Live mode support
+* Added - SSL verification, logging, and customizable settings
+* Added - Webhook handling for payment status updates
