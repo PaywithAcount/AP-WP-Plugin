@@ -129,6 +129,8 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         add_action('woocommerce_api_acountpay_payment_gateway', [$this, 'acountpay_payment_callback']);
         //register webhook endpoint for server-to-server payment notifications
         add_action('woocommerce_api_acountpay_webhook', [$this, 'handle_webhook']);
+        //admin notice when the site URL is not publicly reachable (local/docker testing)
+        add_action('admin_notices', [$this, 'maybe_render_unreachable_host_notice']);
 
         //is valid for use
         if (!$this->is_valid_for_use()) {
@@ -177,11 +179,17 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
 
     /**
      * is available
-     * 
+     *
+     * Chain into WooCommerce's own checks (enabled + currency + min/max + etc.) so we
+     * don't accidentally skip store-level gating that merchants rely on.
      */
     public function is_available()
     {
-        return $this->enabled === 'yes';
+        if ($this->enabled !== 'yes') {
+            return false;
+        }
+
+        return parent::is_available();
     }
 
     /**
@@ -279,15 +287,6 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                 'default' => 'no',
                 'desc_tip' => true
             ],
-            //redirect url
-            'redirect_url' => [
-                'title' => __('Redirect URL', ACOUNTPAY_TEXT_DOMAIN),
-                'type' => 'text',
-                'description' => __('The URL where users will be redirected after successful payment. Leave empty to use the default order received page.', ACOUNTPAY_TEXT_DOMAIN),
-                'default' => '',
-                'placeholder' => __('https://example.com/payment/success', ACOUNTPAY_TEXT_DOMAIN),
-                'desc_tip' => true
-            ],
             //ssl verification
             'sslverify' => [
                 'title' => __('SSL Verification', ACOUNTPAY_TEXT_DOMAIN),
@@ -296,10 +295,30 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                 'description' => __('Verify SSL certificates when making API requests. Recommended for production environments.', ACOUNTPAY_TEXT_DOMAIN),
                 'default' => 'yes',
                 'desc_tip' => true
-            ]
+            ],
+            'webhook_signing_secret' => [
+                'title' => __('Webhook signing secret', ACOUNTPAY_TEXT_DOMAIN),
+                'type' => 'password',
+                'description' => __('Must match MERCHANT_WEBHOOK_SECRET (or JWT fallback) on the AcountPay API. When set, server-to-server webhooks are verified with HMAC-SHA256 before updating orders. Leave empty to skip verification (not recommended in production).', ACOUNTPAY_TEXT_DOMAIN),
+                'default' => '',
+                'desc_tip' => true,
+            ],
         ]);
         //return form fields to woocommerce
         $this->form_fields = $form_fields;
+    }
+
+    /**
+     * Persist settings; keep webhook signing secret when the password field is left blank on save.
+     */
+    public function process_admin_options()
+    {
+        $post_key = 'woocommerce_' . $this->id . '_webhook_signing_secret';
+        $posted_empty = !isset($_POST[$post_key]) || $_POST[$post_key] === '';
+        if ($posted_empty) {
+            unset($_POST[$post_key]);
+        }
+        parent::process_admin_options();
     }
 
     /**
@@ -371,6 +390,53 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         // AcountPay supports multiple currencies
         // Currency validation is handled by the API
             return true;
+    }
+
+    /**
+     * Show an admin notice when this gateway is enabled but the WordPress site URL is
+     * not publicly reachable (localhost, 127.x.x.x, *.local, *.test, *.localhost). In
+     * that environment the POS can't redirect customers back and the AcountPay backend
+     * can't deliver webhooks, so payments will silently look "received" without ever
+     * being confirmed.
+     */
+    public function maybe_render_unreachable_host_notice()
+    {
+        if (!current_user_can('manage_woocommerce')) {
+            return;
+        }
+        if ($this->enabled !== 'yes') {
+            return;
+        }
+
+        $home = function_exists('home_url') ? home_url() : '';
+        if (!is_string($home) || $home === '') {
+            return;
+        }
+
+        $parsed = wp_parse_url($home);
+        $host = isset($parsed['host']) ? strtolower($parsed['host']) : '';
+        if ($host === '') {
+            return;
+        }
+
+        $looks_local = (
+            $host === 'localhost'
+            || strpos($host, '127.') === 0
+            || substr($host, -6) === '.local'
+            || substr($host, -5) === '.test'
+            || substr($host, -10) === '.localhost'
+        );
+        if (!$looks_local) {
+            return;
+        }
+
+        $message = sprintf(
+            /* translators: 1: site URL */
+            __('AcountPay Payment Gateway is enabled, but your WordPress site URL (%1$s) is not publicly reachable. The AcountPay backend will not be able to deliver webhooks to this store, and shoppers finishing payment on their phone will not be redirected back to your checkout. Before going live or testing with a real device, expose your site over a public URL (e.g. ngrok or Cloudflare Tunnel) and update WordPress Address / Site Address (or WP_HOME / WP_SITEURL) accordingly.', ACOUNTPAY_TEXT_DOMAIN),
+            esc_html($home)
+        );
+
+        echo '<div class="notice notice-warning"><p><strong>AcountPay:</strong> ' . wp_kses_post($message) . '</p></div>';
     }
 
     /**
@@ -474,6 +540,14 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             return array('result' => 'failure', 'redirect' => wc_get_checkout_url());
         }
 
+        // Mark the order as pending until the callback + webhook confirm payment.
+        // Without this, an abandoned payment would leave the order in its default post-checkout state.
+        if ($order->get_status() !== 'pending') {
+            $order->update_status('pending', __('Awaiting AcountPay confirmation.', ACOUNTPAY_TEXT_DOMAIN));
+        } else {
+            $order->add_order_note(__('Awaiting AcountPay confirmation.', ACOUNTPAY_TEXT_DOMAIN));
+        }
+
         $this->log_info('process_payment: redirecting to POS', array('order_id' => $order_id));
         return array(
             'result' => 'success',
@@ -568,7 +642,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                     wc_add_notice(__('Payment successful using AcountPay Payment Gateway, thank you for your order.', ACOUNTPAY_TEXT_DOMAIN), 'success');
                     
                     $order->add_order_note(sprintf(__('Payment successful via AcountPay (status: %s, verified).', ACOUNTPAY_TEXT_DOMAIN), $payment_status));
-                    $order->update_status('processing', __('Payment received via AcountPay.', ACOUNTPAY_TEXT_DOMAIN));
+                    // payment_complete() handles the transition (pending/on-hold/failed -> processing/completed) and fires downstream hooks.
                     $order->payment_complete();
                 } else {
                     $this->log_warning('Payment callback: Verification failed, setting order on-hold', array('order_id' => $order_id));
@@ -602,7 +676,6 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                     $this->log_info('Payment callback: Backend confirms payment is complete', array('order_id' => $order_id));
                     wc_add_notice(__('Payment successful using AcountPay Payment Gateway, thank you for your order.', ACOUNTPAY_TEXT_DOMAIN), 'success');
                     $order->add_order_note(__('Payment confirmed via AcountPay (redirect status was pending, backend confirmed paid).', ACOUNTPAY_TEXT_DOMAIN));
-                    $order->update_status('processing', __('Payment received via AcountPay.', ACOUNTPAY_TEXT_DOMAIN));
                     $order->payment_complete();
                 } else {
                     $order->add_order_note(__('Payment is being processed by the bank. Status will update automatically via webhook.', ACOUNTPAY_TEXT_DOMAIN));
@@ -661,7 +734,19 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             return;
         }
 
-        $signature = isset($_SERVER['HTTP_X_ACOUNTPAY_SIGNATURE']) ? sanitize_text_field($_SERVER['HTTP_X_ACOUNTPAY_SIGNATURE']) : '';
+        $signature = isset($_SERVER['HTTP_X_ACOUNTPAY_SIGNATURE']) ? sanitize_text_field(wp_unslash($_SERVER['HTTP_X_ACOUNTPAY_SIGNATURE'])) : '';
+
+        $signing_secret = trim((string) $this->get_option('webhook_signing_secret', ''));
+        if ($signing_secret !== '') {
+            $expected = 'sha256=' . hash_hmac('sha256', $raw_body, $signing_secret);
+            if ($signature === '' || ! hash_equals($expected, $signature)) {
+                $this->log_error('Webhook: Invalid or missing signature', array('order_id' => isset($_GET['order_id']) ? absint($_GET['order_id']) : 0));
+                wp_send_json(array('received' => false, 'error' => 'invalid signature'), 401);
+                return;
+            }
+        } elseif ($signature !== '') {
+            $this->log_info('Webhook: Signature present but webhook_signing_secret not configured; skipping verification');
+        }
 
         $data = json_decode($raw_body, true);
         if (!is_array($data)) {
@@ -712,7 +797,6 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                     $amount !== null ? number_format($amount, 2) : 'N/A',
                     $currency
                 ));
-                $order->update_status('processing', __('Payment confirmed via AcountPay webhook.', ACOUNTPAY_TEXT_DOMAIN));
                 $order->payment_complete();
             }
         } elseif ($status === 'failed' || $status === 'rejected') {
