@@ -131,6 +131,8 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         add_action('woocommerce_api_acountpay_webhook', [$this, 'handle_webhook']);
         //admin notice when the site URL is not publicly reachable (local/docker testing)
         add_action('admin_notices', [$this, 'maybe_render_unreachable_host_notice']);
+        //admin notice when the gateway is enabled but the webhook signing secret is blank
+        add_action('admin_notices', [$this, 'maybe_render_missing_signing_secret_notice']);
 
         //is valid for use
         if (!$this->is_valid_for_use()) {
@@ -299,7 +301,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             'webhook_signing_secret' => [
                 'title' => __('Webhook signing secret', ACOUNTPAY_TEXT_DOMAIN),
                 'type' => 'password',
-                'description' => __('Must match MERCHANT_WEBHOOK_SECRET (or JWT fallback) on the AcountPay API. When set, server-to-server webhooks are verified with HMAC-SHA256 before updating orders. Leave empty to skip verification (not recommended in production).', ACOUNTPAY_TEXT_DOMAIN),
+                'description' => __('Copy this from your AcountPay Merchant Dashboard → Developer → Webhook signing secret. Used to verify that incoming payment webhooks really came from AcountPay (HMAC-SHA256). This value is per-merchant — do not share it. Leaving it blank disables signature verification and is rejected in production.', ACOUNTPAY_TEXT_DOMAIN),
                 'default' => '',
                 'desc_tip' => true,
             ],
@@ -437,6 +439,34 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         );
 
         echo '<div class="notice notice-warning"><p><strong>AcountPay:</strong> ' . wp_kses_post($message) . '</p></div>';
+    }
+
+    /**
+     * Show an error-level admin notice when this gateway is enabled but no
+     * Webhook signing secret is configured. Without the secret, the plugin
+     * rejects every incoming webhook — so live payments will never reach
+     * the "processing/completed" state even if the customer pays.
+     */
+    public function maybe_render_missing_signing_secret_notice()
+    {
+        if (!current_user_can('manage_woocommerce')) {
+            return;
+        }
+        if ($this->enabled !== 'yes') {
+            return;
+        }
+        $signing_secret = trim((string) $this->get_option('webhook_signing_secret', ''));
+        if ($signing_secret !== '') {
+            return;
+        }
+
+        $settings_url = esc_url(admin_url('admin.php?page=wc-settings&tab=checkout&section=' . $this->id));
+        $message = __('AcountPay Payment Gateway is enabled but no Webhook signing secret is configured. Incoming payment webhooks will be rejected until you paste the value from your AcountPay Merchant Dashboard → Developer → Webhook signing secret.', ACOUNTPAY_TEXT_DOMAIN);
+
+        echo '<div class="notice notice-error"><p><strong>AcountPay:</strong> '
+            . esc_html($message)
+            . ' <a href="' . $settings_url . '">' . esc_html__('Open plugin settings', ACOUNTPAY_TEXT_DOMAIN) . '</a>.'
+            . '</p></div>';
     }
 
     /**
@@ -737,15 +767,23 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         $signature = isset($_SERVER['HTTP_X_ACOUNTPAY_SIGNATURE']) ? sanitize_text_field(wp_unslash($_SERVER['HTTP_X_ACOUNTPAY_SIGNATURE'])) : '';
 
         $signing_secret = trim((string) $this->get_option('webhook_signing_secret', ''));
-        if ($signing_secret !== '') {
-            $expected = 'sha256=' . hash_hmac('sha256', $raw_body, $signing_secret);
-            if ($signature === '' || ! hash_equals($expected, $signature)) {
-                $this->log_error('Webhook: Invalid or missing signature', array('order_id' => isset($_GET['order_id']) ? absint($_GET['order_id']) : 0));
-                wp_send_json(array('received' => false, 'error' => 'invalid signature'), 401);
-                return;
-            }
-        } elseif ($signature !== '') {
-            $this->log_info('Webhook: Signature present but webhook_signing_secret not configured; skipping verification');
+        if ($signing_secret === '') {
+            // Fail closed. If no secret is configured the plugin cannot verify
+            // that a POST is really from AcountPay, so anyone who knows the
+            // wc-api URL could mark orders as paid. Merchants must paste the
+            // value shown in their Merchant Dashboard → Developer page.
+            $this->log_error('Webhook: Rejected — webhook signing secret not configured in plugin settings', array(
+                'order_id' => isset($_GET['order_id']) ? absint($_GET['order_id']) : 0,
+            ));
+            wp_send_json(array('received' => false, 'error' => 'signing secret not configured'), 401);
+            return;
+        }
+
+        $expected = 'sha256=' . hash_hmac('sha256', $raw_body, $signing_secret);
+        if ($signature === '' || ! hash_equals($expected, $signature)) {
+            $this->log_error('Webhook: Invalid or missing signature', array('order_id' => isset($_GET['order_id']) ? absint($_GET['order_id']) : 0));
+            wp_send_json(array('received' => false, 'error' => 'invalid signature'), 401);
+            return;
         }
 
         $data = json_decode($raw_body, true);
