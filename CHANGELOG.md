@@ -7,6 +7,50 @@ The plugin follows [Semantic Versioning](https://semver.org/) once it leaves
 2.x. Until then, the major number tracks the AcountPay payment-link API
 generation (v2 → 2.x).
 
+## 2.1.6 — 2026-04-19
+
+### Fixed
+
+- **"Refresh bank list" now actually refreshes.** The 2.1.5 proxy still routed
+  through `new AcountPay_Payment_Gateway()`, whose constructor calls
+  `init_form_fields()` → `get_supported_banks()` → `get_country_banks()`,
+  meaning every refresh request fired *two* HTTP calls back-to-back inside a
+  single admin-ajax request. On slow networks the constructor's call would
+  exhaust PHP `max_execution_time` before our handler ever ran, and the
+  button would silently fall back to the generic error pill. The proxy is
+  now lightweight: it reads merchant settings directly from
+  `wp_options` and instantiates only `AcountPay_API`, skipping all gateway
+  bootstrapping. The old heavyweight path is still used for *Re-verify
+  status* (which legitimately needs the order/payment plumbing).
+- The refresh handler now also drops the `_stale` 7-day fallback transient,
+  not just the 24h fresh cache, so a forced refresh isn't masked by
+  yesterday's empty list.
+- Refresh + Test-connection error pills now wrap and stay readable on
+  long messages (`white-space: normal; max-width: 600px;`) and explicitly
+  surface the upstream URL the plugin pinged plus the API's own message,
+  so a merchant can paste it into a support ticket without enabling logs.
+
+## 2.1.5 — 2026-04-19
+
+### Fixed
+
+- **"Test connection" button now actually runs.** The `wp_ajax_*` handlers
+  for *Test connection*, *Refresh bank list* and *Re-verify payment status*
+  were previously registered inside `AcountPay_Payment_Gateway::__construct()`
+  — but WooCommerce only instantiates a payment gateway on demand (typically
+  only when the WC Settings → Payments page renders). On a plain
+  `admin-ajax.php` request the constructor never ran, no handler was bound,
+  WordPress echoed the literal `0`, and the JS surfaced the misleading
+  "Request failed" pill no matter what the API base URL was. Three top-level
+  proxy functions are now registered on `plugins_loaded`; they lazily
+  instantiate the gateway (preferring Woo's cached instance) and dispatch
+  to the existing handler, so the button works regardless of how the admin
+  page was reached.
+- The Test-connection JS now distinguishes between admin-ajax's `0` (no
+  handler bound — instructs the merchant to deactivate / reactivate the
+  plugin), `-1` (nonce / permission rejection), non-2xx HTTP responses, and
+  genuine network errors, instead of always printing "Request failed".
+
 ## 2.1.4 — 2026-04-19
 
 ### Added

@@ -6,7 +6,7 @@
  * Author:      AcountPay
  * Author URI:  https://acountpay.com
  * Description: Pay by Bank for WooCommerce, powered by AcountPay. Lets shoppers pay directly from their bank account via PSD2 / open banking, with a configurable bank-logo carousel, classic + block checkout support, signed callbacks, signed server-to-server webhooks, an order-edit panel showing payment id and PSU lookup state, and a manual-refund flow driven from the AcountPay Merchant Dashboard.
- * Version:     2.1.4
+ * Version:     2.1.6
  * Requires at least: 5.8
  * Tested up to: 6.9.1
  * Requires PHP: 7.4
@@ -23,7 +23,7 @@ if (!defined('ABSPATH')) {
 }
 
 //define the plugin constants
-define('ACOUNTPAY_PAYMENT_VERSION', '2.1.4');
+define('ACOUNTPAY_PAYMENT_VERSION', '2.1.6');
 define('ACOUNTPAY_PAYMENT_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('ACOUNTPAY_PAYMENT_PLUGIN_PATH', plugin_dir_path(__FILE__));
 define('ACOUNTPAY_TEXT_DOMAIN', 'acountpay-payment');
@@ -56,6 +56,148 @@ if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get
     add_filter('woocommerce_payment_gateways', 'acountpay_payment_gateway');
     //woocommerce_blocks_loaded
     add_action('woocommerce_blocks_loaded', 'acountpay_payment_block_support');
+
+    // Register admin AJAX hooks at module-load time. Without this, the hooks
+    // only get bound from inside AcountPay_Payment_Gateway::__construct(),
+    // which WooCommerce only triggers on demand (typically only when the WC
+    // Settings → Payments page is rendered). In a plain admin-ajax.php
+    // request the gateway is never instantiated, the action has no handler,
+    // admin-ajax echoes the literal "0", and the JS shows "Request failed"
+    // with no useful message. Registering the proxy here guarantees a
+    // handler is always wired up for admins.
+    add_action('wp_ajax_acountpay_test_connection', 'acountpay_ajax_proxy_test_connection');
+    add_action('wp_ajax_acountpay_refresh_banks', 'acountpay_ajax_proxy_refresh_banks');
+    add_action('wp_ajax_acountpay_reverify_order', 'acountpay_ajax_proxy_reverify_order');
+}
+
+/**
+ * Lazily instantiate the gateway and dispatch the named handler. This is
+ * called from the top-level AJAX hooks above so admin-ajax.php always has a
+ * handler bound, even if WooCommerce hasn't otherwise loaded its payment
+ * gateway list during this request.
+ */
+function acountpay_resolve_gateway()
+{
+    if (!class_exists('AcountPay_Payment_Gateway')) {
+        if (defined('ACOUNTPAY_PAYMENT_PLUGIN_PATH')) {
+            $api_path = ACOUNTPAY_PAYMENT_PLUGIN_PATH . '/includes/class-acountpay-api.php';
+            $gw_path  = ACOUNTPAY_PAYMENT_PLUGIN_PATH . '/includes/main-file.php';
+            if (file_exists($api_path)) include_once $api_path;
+            if (file_exists($gw_path))  include_once $gw_path;
+        }
+    }
+    if (!class_exists('AcountPay_Payment_Gateway')) {
+        return null;
+    }
+
+    // Prefer Woo's cached instance so we share the same in-memory option
+    // values + nonces with anything else on the page.
+    if (function_exists('WC') && WC() && WC()->payment_gateways()) {
+        $gateways = WC()->payment_gateways()->payment_gateways();
+        if (!empty($gateways['acountpay_payment'])) {
+            return $gateways['acountpay_payment'];
+        }
+    }
+    return new AcountPay_Payment_Gateway();
+}
+
+/**
+ * Read the merchant's gateway settings without instantiating the full
+ * gateway class. WooCommerce stores them in
+ * wp_options under "woocommerce_acountpay_payment_settings".
+ *
+ * Used by the lightweight AJAX proxies below — instantiating the real
+ * gateway triggers init_form_fields(), which itself fires an HTTP call
+ * to the bank-list endpoint inside the constructor and significantly
+ * increases the chance an admin-ajax request times out before our
+ * handler ever runs.
+ */
+function acountpay_get_settings()
+{
+    $opts = get_option('woocommerce_acountpay_payment_settings', array());
+    if (!is_array($opts)) {
+        $opts = array();
+    }
+    return $opts;
+}
+
+function acountpay_make_api_client()
+{
+    if (!class_exists('AcountPay_API') && defined('ACOUNTPAY_PAYMENT_PLUGIN_PATH')) {
+        $api_path = ACOUNTPAY_PAYMENT_PLUGIN_PATH . '/includes/class-acountpay-api.php';
+        if (file_exists($api_path)) include_once $api_path;
+    }
+    if (!class_exists('AcountPay_API')) {
+        return null;
+    }
+    $opts = acountpay_get_settings();
+    $api_base_url      = isset($opts['api_base_url']) && $opts['api_base_url'] !== '' ? $opts['api_base_url'] : 'https://api.acountpay.com';
+    $logging_enabled   = isset($opts['logging']) && $opts['logging'] === 'yes';
+    $sslverify_enabled = !isset($opts['sslverify']) || $opts['sslverify'] !== 'no';
+    return new AcountPay_API($api_base_url, $logging_enabled, $sslverify_enabled);
+}
+
+function acountpay_ajax_proxy_test_connection()
+{
+    if (!current_user_can('manage_woocommerce')) {
+        wp_send_json_error(array('message' => 'Insufficient permissions'), 403);
+    }
+    check_ajax_referer('acountpay_test_connection');
+
+    $api = acountpay_make_api_client();
+    if (!$api) {
+        wp_send_json_error(array('message' => 'AcountPay API client could not be loaded — is the plugin active?'));
+    }
+    $result = $api->verify_connection();
+    if (is_wp_error($result)) {
+        wp_send_json_error(array('message' => $result->get_error_message()));
+    }
+    wp_send_json_success(array('message' => 'Connection OK'));
+}
+
+function acountpay_ajax_proxy_refresh_banks()
+{
+    if (!current_user_can('manage_woocommerce')) {
+        wp_send_json_error(array('message' => 'Insufficient permissions'), 403);
+    }
+    check_ajax_referer('acountpay_refresh_banks');
+
+    $opts    = acountpay_get_settings();
+    $country = isset($_POST['country']) ? strtoupper(substr(sanitize_text_field(wp_unslash($_POST['country'])), 0, 2)) : '';
+    if ($country === '') {
+        $country = isset($opts['bank_country']) ? strtoupper((string) $opts['bank_country']) : 'FI';
+    }
+
+    $cache_key = 'acountpay_banks_' . strtolower($country);
+    delete_transient($cache_key);
+    delete_transient($cache_key . '_stale');
+
+    $api = acountpay_make_api_client();
+    if (!$api) {
+        wp_send_json_error(array('message' => 'AcountPay API client could not be loaded — is the plugin active?'));
+    }
+    $result = $api->get_country_banks($country, true);
+    if (is_wp_error($result)) {
+        $base = method_exists($api, 'get_api_base_url') ? $api->get_api_base_url() : '';
+        $url  = rtrim($base, '/') . '/v1/banks/public/logos?country=' . $country;
+        $msg  = $result->get_error_message();
+        if ($msg === '') $msg = $result->get_error_code();
+        wp_send_json_error(array('message' => 'Could not load banks from ' . $url . ' — ' . $msg));
+    }
+    wp_send_json_success(array(
+        'message' => sprintf('%d banks loaded for %s', count($result), $country),
+    ));
+}
+
+function acountpay_ajax_proxy_reverify_order()
+{
+    // Re-verify still needs the full gateway (it touches order meta, payment
+    // status mapping, hooks etc.), so route through the heavyweight path.
+    $gw = acountpay_resolve_gateway();
+    if (!$gw) {
+        wp_send_json_error(array('message' => 'AcountPay gateway could not be loaded. Please reactivate the plugin.'));
+    }
+    $gw->ajax_reverify_order();
 }
 
 /**

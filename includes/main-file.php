@@ -156,7 +156,13 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         // webhook race is still in flight.
         add_action('woocommerce_thankyou_' . $this->id, [$this, 'render_awaiting_confirmation_notice']);
 
-        // AJAX endpoints — admin-only "Test connection" and "Re-verify status".
+        // AJAX endpoints — admin-only "Test connection", "Refresh banks",
+        // "Re-verify status". These are *also* registered at module-load time
+        // in acountpay-payment.php so admin-ajax.php finds a handler even
+        // when WooCommerce hasn't instantiated payment gateways yet (the
+        // common case for ad-hoc admin-ajax requests). Re-registering here
+        // is harmless — WordPress de-duplicates identical [object, method]
+        // callbacks via _wp_filter_build_unique_id.
         add_action('wp_ajax_acountpay_test_connection', [$this, 'ajax_test_connection']);
         add_action('wp_ajax_acountpay_refresh_banks', [$this, 'ajax_refresh_banks']);
         add_action('wp_ajax_acountpay_reverify_order', [$this, 'ajax_reverify_order']);
@@ -708,10 +714,14 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                 'title'       => __('Payment reference (shown on customer\'s bank statement)', ACOUNTPAY_TEXT_DOMAIN),
                 'type'        => 'text',
                 'description' => sprintf(
-                    /* translators: 1: list of placeholders, 2: example output */
-                    __('This text is sent to the customer\'s bank as the payment reference (remittance information) and is what they will see on their bank statement next to the transaction. Use placeholders to inject order data: %1$s. Example: %2$s. Leave blank to fall back to the bare WooCommerce order number.', ACOUNTPAY_TEXT_DOMAIN),
+                    /* translators: 1: site title example, 2: placeholder list, 3: example output, 4: site title only example, 5: name + number example, 6: free text example */
+                    __('<strong>This is the text your customer will see on their bank statement</strong> next to the transaction. Use it to make sure they recognise the charge — typically your business name plus an order number.<br/><br/><strong>You can type anything you want here</strong>, including your business name (e.g. <code>%1$s #1234</code>). To pull live data from the order, use these placeholders: %2$s. The default <code>{site_title} #{order_number}</code> renders as %3$s — it pulls from <em>WordPress → Settings → General → Site Title</em>.<br/><br/><strong>Examples:</strong> %4$s · %5$s · %6$s.<br/><br/>Leave blank to fall back to just the bare WooCommerce order number (not recommended — most customers won\'t recognise a 4-digit integer on their statement).', ACOUNTPAY_TEXT_DOMAIN),
+                    esc_html(get_bloginfo('name') ?: 'Acme Shop'),
                     '<code>{order_number}</code>, <code>{order_id}</code>, <code>{site_title}</code>, <code>{first_name}</code>, <code>{last_name}</code>',
-                    '<code>' . esc_html(get_bloginfo('name') ?: 'My Shop') . ' #1234</code>'
+                    '<code>' . esc_html(get_bloginfo('name') ?: 'Acme Shop') . ' #1234</code>',
+                    '<code>{site_title}</code> → <code>' . esc_html(get_bloginfo('name') ?: 'Acme Shop') . '</code>',
+                    '<code>{site_title} order {order_number}</code> → <code>' . esc_html(get_bloginfo('name') ?: 'Acme Shop') . ' order 1234</code>',
+                    '<code>Acme Shop #{order_number}</code> → <code>Acme Shop #1234</code>'
                 ),
                 'default'     => '{site_title} #{order_number}',
                 'placeholder' => '{site_title} #{order_number}',
@@ -907,21 +917,33 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                         fd.append('action', 'acountpay_test_connection');
                         fd.append('_wpnonce', btn.dataset.nonce);
                         fetch(ajaxurl, { method: 'POST', credentials: 'same-origin', body: fd })
-                            .then(function(r){ return r.json(); })
-                            .then(function(data){
+                            .then(function(r){ return r.text().then(function(t){ return { status: r.status, text: t }; }); })
+                            .then(function(resp){
                                 btn.disabled = false;
                                 btn.textContent = btn.dataset.default;
+                                var data = null;
+                                try { data = JSON.parse(resp.text); } catch(e) { /* non-JSON */ }
                                 if (data && data.success) {
                                     out.innerHTML = '<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:#d6f4dc;color:#0a7d20;font-weight:600;">' + (data.data && data.data.message ? data.data.message : 'OK') + '</span>';
-                                } else {
-                                    var msg = (data && data.data && data.data.message) ? data.data.message : 'Request failed';
-                                    out.innerHTML = '<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:#fde2e2;color:#a40000;font-weight:600;">' + msg + '</span>';
+                                    return;
                                 }
+                                var msg;
+                                if (data && data.data && data.data.message) {
+                                    msg = data.data.message;
+                                } else if (resp.text === '0' || resp.text === '-1') {
+                                    // admin-ajax returns "0" when no action handler is bound and "-1"
+                                    // for nonce / capability rejections. Both leave the JS without a
+                                    // useful payload, so spell it out for the merchant.
+                                    msg = 'Plugin AJAX handler is not registered. Try deactivating + reactivating the AcountPay plugin.';
+                                } else {
+                                    msg = 'Request failed (HTTP ' + resp.status + ')';
+                                }
+                                out.innerHTML = '<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:#fde2e2;color:#a40000;font-weight:600;">' + msg + '</span>';
                             })
                             .catch(function(err){
                                 btn.disabled = false;
                                 btn.textContent = btn.dataset.default;
-                                out.innerHTML = '<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:#fde2e2;color:#a40000;font-weight:600;">' + err.message + '</span>';
+                                out.innerHTML = '<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:#fde2e2;color:#a40000;font-weight:600;">' + (err && err.message ? err.message : 'Network error') + '</span>';
                             });
                     });
                 })();
@@ -990,22 +1012,36 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                         var countryEl = document.getElementById('woocommerce_acountpay_payment_bank_country');
                         if (countryEl) { fd.append('country', countryEl.value || 'FI'); }
                         fetch(ajaxurl, { method: 'POST', credentials: 'same-origin', body: fd })
-                            .then(function(r){ return r.json(); })
-                            .then(function(data){
+                            .then(function(r){ return r.text().then(function(t){ return { status: r.status, text: t }; }); })
+                            .then(function(resp){
                                 btn.disabled = false;
                                 btn.textContent = btn.dataset.default;
+                                var data = null;
+                                try { data = JSON.parse(resp.text); } catch(e) { /* non-JSON */ }
                                 if (data && data.success) {
                                     out.innerHTML = '<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:#d6f4dc;color:#0a7d20;font-weight:600;">' + (data.data && data.data.message ? data.data.message : 'OK') + '</span>';
                                     setTimeout(function(){ window.location.reload(); }, 800);
-                                } else {
-                                    var msg = (data && data.data && data.data.message) ? data.data.message : 'Request failed';
-                                    out.innerHTML = '<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:#fde2e2;color:#a40000;font-weight:600;">' + msg + '</span>';
+                                    return;
                                 }
+                                var msg;
+                                if (data && data.data && data.data.message) {
+                                    msg = data.data.message;
+                                } else if (resp.text === '0' || resp.text === '-1') {
+                                    msg = 'Plugin AJAX handler is not registered. Try deactivating + reactivating the AcountPay plugin.';
+                                } else {
+                                    msg = 'Request failed (HTTP ' + resp.status + ')';
+                                }
+                                // Render escaped text so we don't accidentally inject HTML from the server.
+                                var span = document.createElement('span');
+                                span.style.cssText = 'display:inline-block;padding:4px 10px;border-radius:999px;background:#fde2e2;color:#a40000;font-weight:600;max-width:600px;white-space:normal;line-height:1.4;';
+                                span.textContent = msg;
+                                out.innerHTML = '';
+                                out.appendChild(span);
                             })
                             .catch(function(err){
                                 btn.disabled = false;
                                 btn.textContent = btn.dataset.default;
-                                out.innerHTML = '<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:#fde2e2;color:#a40000;font-weight:600;">' + err.message + '</span>';
+                                out.innerHTML = '<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:#fde2e2;color:#a40000;font-weight:600;">' + (err && err.message ? err.message : 'Network error') + '</span>';
                             });
                     });
                 })();
@@ -1032,16 +1068,33 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             $country = strtoupper((string) $this->get_option('bank_country', 'FI'));
         }
 
+        // Drop both the 24h "fresh" cache *and* the 7d "stale" fallback so a
+        // truly forced refresh isn't masked by yesterday's empty list.
         $cache_key = 'acountpay_banks_' . strtolower($country);
         delete_transient($cache_key);
+        delete_transient($cache_key . '_stale');
 
-        if (!isset($this->api) || !$this->api) {
-            wp_send_json_error(array('message' => __('API not initialised', ACOUNTPAY_TEXT_DOMAIN)));
+        $api = $this->get_api_for_banks();
+        if (!$api) {
+            wp_send_json_error(array('message' => __('API client could not be initialised — check that the AcountPay plugin is active.', ACOUNTPAY_TEXT_DOMAIN)));
         }
 
-        $result = $this->api->get_country_banks($country, true);
+        $result = $api->get_country_banks($country, true);
         if (is_wp_error($result)) {
-            wp_send_json_error(array('message' => $result->get_error_message()));
+            $api_base = method_exists($api, 'get_api_base_url') ? $api->get_api_base_url() : '';
+            $endpoint = '/v1/banks/public/logos?country=' . $country;
+            $detail   = $result->get_error_message();
+            if ($detail === '') {
+                $detail = $result->get_error_code();
+            }
+            wp_send_json_error(array(
+                'message' => sprintf(
+                    /* translators: %1$s = full URL the plugin pinged, %2$s = upstream error message */
+                    __('Could not load banks from %1$s — %2$s', ACOUNTPAY_TEXT_DOMAIN),
+                    rtrim($api_base, '/') . $endpoint,
+                    $detail
+                ),
+            ));
         }
         wp_send_json_success(array(
             'message' => sprintf(
