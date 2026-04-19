@@ -1,0 +1,72 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: AcountPay Payment Gateway 2.0.0\n"
+"Report-Msgid-Bugs-To: https://acountpay.com\n"
+"POT-Creation-Date: 2026-04-19 00:00+0000\n"
+"PO-Revision-Date: 2026-04-19 00:00+0000\n"
+"Language-Team: Finnish <fi@acountpay.com>\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: fi\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+# Gateway label / branding
+msgid "Pay by Bank"
+msgstr "Maksa pankkitilillä"
+
+msgid "Let your customers pay directly from their bank account via Pay by Bank (powered by AcountPay)."
+msgstr "Anna asiakkaidesi maksaa suoraan pankkitililtään Pay by Bank -palvelulla (AcountPayn tarjoama)."
+
+msgid "Pay securely and directly from your bank account."
+msgstr "Maksa turvallisesti suoraan pankkitililtäsi."
+
+msgid "Enable Pay by Bank"
+msgstr "Ota Pay by Bank käyttöön"
+
+# Settings labels
+msgid "Title"
+msgstr "Otsikko"
+
+msgid "This controls the title which the user sees during checkout."
+msgstr "Tämä määrittää otsikon, jonka käyttäjä näkee kassalla."
+
+msgid "Description"
+msgstr "Kuvaus"
+
+msgid "This controls the description which the user sees during checkout."
+msgstr "Tämä määrittää kuvauksen, jonka käyttäjä näkee kassalla."
+
+msgid "Bank logos"
+msgstr "Pankkien logot"
+
+msgid "Pick which bank logos appear in the auto-scrolling carousel next to the Pay by Bank label on checkout. Defaults to all supported Finnish banks."
+msgstr "Valitse, mitkä pankkilogot näkyvät automaattisesti vierivässä karusellissa Pay by Bank -nimen vieressä kassalla. Oletuksena kaikki tuetut suomalaiset pankit."
+
+msgid "Show \"How it works\" info bubble"
+msgstr "Näytä \"Näin se toimii\" -infokupla"
+
+msgid "Show a small (i) info bubble next to the Pay by Bank label that explains the 3 payment steps to shoppers."
+msgstr "Näytä pieni (i)-infokupla Pay by Bank -nimen vieressä, joka selittää asiakkaille kolme maksuvaihetta."
+
+msgid "Skip desktop QR page"
+msgstr "Ohita työpöydän QR-sivu"
+
+msgid "Send desktop shoppers straight to bank selection (skip the scan-with-phone QR step)."
+msgstr "Ohjaa työpöytäasiakkaat suoraan pankin valintaan (ohita puhelimella skannattava QR-vaihe)."
+
+msgid "When enabled, desktop shoppers go directly to the bank selector on the AcountPay pay page instead of seeing the QR / continue-on-this-device screen first."
+msgstr "Kun tämä on käytössä, työpöytäasiakkaat siirtyvät suoraan pankin valintaan AcountPayn maksusivulla sen sijaan, että näkisivät ensin QR-/jatka tällä laitteella -näytön."
+
+# Info bubble
+msgid "How Pay by Bank works"
+msgstr "Näin Pay by Bank toimii"
+
+msgid "Select your bank"
+msgstr "Valitse pankkisi"
+
+msgid "Log in to your bank app or netbank"
+msgstr "Kirjaudu pankkisovellukseen tai verkkopankkiin"
+
+msgid "Authorise the payment"
+msgstr "Vahvista maksu"

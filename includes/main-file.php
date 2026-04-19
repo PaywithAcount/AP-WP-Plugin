@@ -72,11 +72,12 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         //has fields
         $this->has_fields = true;
         //method title
-        $this->method_title = __('AcountPay Payment Gateway', ACOUNTPAY_TEXT_DOMAIN);
+        $this->method_title = __('Pay by Bank', ACOUNTPAY_TEXT_DOMAIN);
         //description
-        $this->method_description = __('This plugin allows you to accept payment on your website using AcountPay Payment Gateway.', ACOUNTPAY_TEXT_DOMAIN);
-        //icon
-        $this->icon = $this->get_logo_url();
+        $this->method_description = __('Let your customers pay directly from their bank account via Pay by Bank (powered by AcountPay).', ACOUNTPAY_TEXT_DOMAIN);
+        // We render our own logo carousel inside get_title(); leaving $this->icon empty
+        // prevents WooCommerce from also rendering the legacy single-icon next to our label.
+        $this->icon = '';
         //supports
         $this->supports = array(
             'products'
@@ -115,10 +116,17 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         $sslverify_enabled = $this->sslverify === 'yes';
         $this->api = new AcountPay_API($api_base_url, $logging_enabled, $sslverify_enabled);
 
+        // Don't let the customer cancel an order from My Account while it's
+        // still pending — the webhook may already be in flight and cancelling
+        // would race with it.
+        $this->remove_cancel_order_button = true;
+
         //process admin options
         add_action('woocommerce_update_options_payment_gateways_' . $this->id, [$this, 'process_admin_options']);
         //register styles
         add_action('wp_enqueue_scripts', [$this, 'enqueue_styles']);
+        //also fire on the Blocks checkout page where wp_enqueue_scripts can run before is_checkout()
+        add_action('enqueue_block_assets', [$this, 'enqueue_styles']);
         //admin script
         add_action('admin_enqueue_scripts', [$this, 'admin_scripts']);
         //woocommerce available payment gateways
@@ -134,6 +142,24 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         //admin notice when the gateway is enabled but the webhook signing secret is blank
         add_action('admin_notices', [$this, 'maybe_render_missing_signing_secret_notice']);
 
+        // Order edit screen meta box (HPOS-aware): show payment id, status,
+        // refunded amount, last webhook timestamp + a re-verify button.
+        add_action('add_meta_boxes', [$this, 'register_order_meta_box']);
+
+        // Order list column with a small "AP" status pill (both legacy and HPOS).
+        add_filter('manage_edit-shop_order_columns', [$this, 'register_order_list_column']);
+        add_action('manage_shop_order_posts_custom_column', [$this, 'render_order_list_column'], 10, 2);
+        add_filter('woocommerce_shop_order_list_table_columns', [$this, 'register_order_list_column']);
+        add_action('woocommerce_shop_order_list_table_custom_column', [$this, 'render_order_list_column_hpos'], 10, 2);
+
+        // Thank-you page: show "awaiting bank confirmation" hint while the
+        // webhook race is still in flight.
+        add_action('woocommerce_thankyou_' . $this->id, [$this, 'render_awaiting_confirmation_notice']);
+
+        // AJAX endpoints — admin-only "Test connection" and "Re-verify status".
+        add_action('wp_ajax_acountpay_test_connection', [$this, 'ajax_test_connection']);
+        add_action('wp_ajax_acountpay_reverify_order', [$this, 'ajax_reverify_order']);
+
         //is valid for use
         if (!$this->is_valid_for_use()) {
             //disable the gateway because the current currency is not supported
@@ -143,6 +169,10 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
 
     /**
      * Get AcountPay payment icon URL.
+     *
+     * Kept for backwards compatibility / the woocommerce_acountpay_payment_icon
+     * filter, but no longer rendered by default — we now show a configurable
+     * bank-logo carousel inside get_title().
      */
     public function get_logo_url()
     {
@@ -151,18 +181,120 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
     }
 
     /**
-     * Filter gateway title output for better styling
+     * Curated list of bank logos shipped with the plugin, keyed by slug.
+     * Slug must match the SVG filename under assets/images/banks/.
+     */
+    public function get_supported_banks()
+    {
+        return array(
+            'op'               => 'OP',
+            'nordea'           => 'Nordea',
+            'danske-bank'      => 'Danske Bank',
+            's-pankki'         => 'S-Pankki',
+            'aktia'            => 'Aktia',
+            'handelsbanken'    => 'Handelsbanken',
+            'saastopankki'     => 'Säästöpankki',
+            'pop-pankki'       => 'POP Pankki',
+            'alandsbanken'     => 'Ålandsbanken',
+            'oma-saastopankki' => 'Oma Säästöpankki',
+        );
+    }
+
+    /**
+     * Resolve the merchant-selected bank logos to renderable items.
+     *
+     * @return array<int, array{slug:string,name:string,url:string}>
+     */
+    public function get_bank_logo_urls()
+    {
+        $supported = $this->get_supported_banks();
+        $selected  = $this->get_option('bank_logos', array_keys($supported));
+        if (!is_array($selected)) {
+            $selected = array_keys($supported);
+        }
+
+        $urls = array();
+        foreach ($selected as $slug) {
+            if (!isset($supported[$slug])) {
+                continue;
+            }
+            $relative = 'assets/images/banks/' . $slug . '.svg';
+            $absolute = ACOUNTPAY_PAYMENT_PLUGIN_PATH . $relative;
+            if (!file_exists($absolute)) {
+                continue;
+            }
+            $urls[] = array(
+                'slug' => $slug,
+                'name' => $supported[$slug],
+                'url'  => WC_HTTPS::force_https_url(ACOUNTPAY_PAYMENT_PLUGIN_URL . $relative),
+            );
+        }
+
+        return apply_filters('woocommerce_acountpay_bank_logos', $urls, $this->id);
+    }
+
+    /**
+     * Three-step explanation shown in the "How it works" info bubble.
+     *
+     * @return array<int, string>
+     */
+    public function get_info_steps()
+    {
+        return array(
+            __('Select your bank', ACOUNTPAY_TEXT_DOMAIN),
+            __('Log in to your bank app or netbank', ACOUNTPAY_TEXT_DOMAIN),
+            __('Authorise the payment', ACOUNTPAY_TEXT_DOMAIN),
+        );
+    }
+
+    /**
+     * Heading shown above the 3-step list in the info bubble.
+     */
+    public function get_info_heading()
+    {
+        return __('How Pay by Bank works', ACOUNTPAY_TEXT_DOMAIN);
+    }
+
+    /**
+     * Filter gateway title output: render the title, an auto-scrolling carousel
+     * of the merchant-selected bank logos, and an optional "i" info bubble.
      */
     public function get_title()
     {
-        $title = parent::get_title();
-        $logo_url = $this->get_logo_url();
-        
-        if ($logo_url) {
-            return '<span class="acountpay-payment-label"><img src="' . esc_url($logo_url) . '" alt="' . esc_attr($title) . '" class="acountpay-payment-logo" /><span class="acountpay-payment-title">' . $title . '</span></span>';
+        $title  = parent::get_title();
+        $output = '<span class="acountpay-payment-label">'
+            . '<span class="acountpay-payment-title">' . $title . '</span>';
+
+        $logos = $this->get_bank_logo_urls();
+        if (!empty($logos)) {
+            $items = '';
+            // Render the list twice so the marquee can translateX(-50%) seamlessly.
+            foreach (array_merge($logos, $logos) as $logo) {
+                $items .= '<img class="acountpay-bank-logo" src="' . esc_url($logo['url']) . '" alt="' . esc_attr($logo['name']) . '" loading="lazy" />';
+            }
+            $output .= '<span class="acountpay-bank-carousel" aria-hidden="true">'
+                . '<span class="acountpay-bank-carousel-track">' . $items . '</span>'
+                . '</span>';
         }
-        
-        return $title;
+
+        if ('yes' === $this->get_option('show_info_bubble', 'yes')) {
+            $heading    = esc_html($this->get_info_heading());
+            $aria_label = esc_attr($this->get_info_heading());
+            $steps_html = '';
+            foreach ($this->get_info_steps() as $step) {
+                $steps_html .= '<li>' . esc_html($step) . '</li>';
+            }
+            $output .= '<span class="acountpay-info-wrap">'
+                . '<button type="button" class="acountpay-info-bubble" aria-label="' . $aria_label . '" aria-expanded="false">i</button>'
+                . '<span class="acountpay-info-popover" role="tooltip">'
+                    . '<strong>' . $heading . '</strong>'
+                    . '<ol>' . $steps_html . '</ol>'
+                . '</span>'
+                . '</span>';
+        }
+
+        $output .= '</span>';
+        return $output;
     }
 
     /**
@@ -201,13 +333,26 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
      */
     public function enqueue_styles()
     {
-        // Only load on checkout and order-pay pages
-        if (!is_checkout() && !is_wc_endpoint_url('order-pay')) {
+        if ($this->enabled === 'no') {
             return;
         }
 
-        // Check if gateway is enabled
-        if ($this->enabled === 'no') {
+        // Decide whether we're on a page that renders the gateway label. Cover:
+        // - Classic checkout (is_checkout)
+        // - "Pay for order" page (order-pay endpoint)
+        // - Blocks checkout (page contains the wc/checkout block — enqueue_block_assets fires before is_checkout returns true on some themes, so fall back to a permissive check)
+        $on_checkout_like_page = false;
+        if (function_exists('is_checkout') && is_checkout()) {
+            $on_checkout_like_page = true;
+        } elseif (function_exists('is_wc_endpoint_url') && is_wc_endpoint_url('order-pay')) {
+            $on_checkout_like_page = true;
+        } elseif (function_exists('has_block')) {
+            $post = get_post();
+            if ($post && (has_block('woocommerce/checkout', $post) || has_block('woocommerce/cart', $post))) {
+                $on_checkout_like_page = true;
+            }
+        }
+        if (!$on_checkout_like_page) {
             return;
         }
 
@@ -217,6 +362,17 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             array(),
             ACOUNTPAY_PAYMENT_VERSION
         );
+
+        // Info-bubble toggle for classic checkout. Blocks checkout has its own React handler in src/block.js.
+        if ('yes' === $this->get_option('show_info_bubble', 'yes')) {
+            wp_enqueue_script(
+                'acountpay-info-bubble',
+                ACOUNTPAY_PAYMENT_PLUGIN_URL . 'assets/js/info-bubble.js',
+                array(),
+                ACOUNTPAY_PAYMENT_VERSION,
+                true
+            );
+        }
     }
 
     /**
@@ -244,26 +400,52 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
      */
     public function init_form_fields()
     {
+        $supported_banks = $this->get_supported_banks();
+
         $form_fields = apply_filters('woo_acountpay_payment', [
             'enabled' => [
                 'title' => __('Enable/Disable', ACOUNTPAY_TEXT_DOMAIN),
                 'type' => 'checkbox',
-                'label' => __('Enable AcountPay Payment Gateway', ACOUNTPAY_TEXT_DOMAIN),
+                'label' => __('Enable Pay by Bank', ACOUNTPAY_TEXT_DOMAIN),
                 'default' => 'no'
             ],
             'title' => [
                 'title' => __('Title', ACOUNTPAY_TEXT_DOMAIN),
                 'type' => 'text',
                 'description' => __('This controls the title which the user sees during checkout.', ACOUNTPAY_TEXT_DOMAIN),
-                'default' => __('AcountPay Payment Gateway', ACOUNTPAY_TEXT_DOMAIN),
+                'default' => __('Pay by Bank', ACOUNTPAY_TEXT_DOMAIN),
                 'desc_tip' => true
             ],
             'description' => [
                 'title' => __('Description', ACOUNTPAY_TEXT_DOMAIN),
                 'type' => 'textarea',
                 'description' => __('This controls the description which the user sees during checkout.', ACOUNTPAY_TEXT_DOMAIN),
-                'default' => __('Pay securely using your bank account via AcountPay Payment Gateway.', ACOUNTPAY_TEXT_DOMAIN),
+                'default' => __('Pay securely and directly from your bank account.', ACOUNTPAY_TEXT_DOMAIN),
                 'desc_tip' => true
+            ],
+            'bank_logos' => [
+                'title' => __('Bank logos', ACOUNTPAY_TEXT_DOMAIN),
+                'type' => 'multiselect',
+                'class' => 'wc-enhanced-select',
+                'css' => 'min-width: 350px;',
+                'description' => __('Pick which bank logos appear in the auto-scrolling carousel next to the Pay by Bank label on checkout. Defaults to all supported Finnish banks.', ACOUNTPAY_TEXT_DOMAIN),
+                'options' => $supported_banks,
+                'default' => array_keys($supported_banks),
+                'desc_tip' => true,
+            ],
+            'show_info_bubble' => [
+                'title' => __('Show "How it works" info bubble', ACOUNTPAY_TEXT_DOMAIN),
+                'type' => 'checkbox',
+                'label' => __('Show a small (i) info bubble next to the Pay by Bank label that explains the 3 payment steps to shoppers.', ACOUNTPAY_TEXT_DOMAIN),
+                'default' => 'yes',
+            ],
+            'skip_desktop_qr' => [
+                'title' => __('Skip desktop QR page', ACOUNTPAY_TEXT_DOMAIN),
+                'type' => 'checkbox',
+                'label' => __('Send desktop shoppers straight to bank selection (skip the scan-with-phone QR step).', ACOUNTPAY_TEXT_DOMAIN),
+                'description' => __('When enabled, desktop shoppers go directly to the bank selector on the AcountPay pay page instead of seeing the QR / continue-on-this-device screen first.', ACOUNTPAY_TEXT_DOMAIN),
+                'default' => 'no',
+                'desc_tip' => true,
             ],
             'client_id' => [
                 'title' => __('Client ID', ACOUNTPAY_TEXT_DOMAIN),
@@ -305,9 +487,187 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                 'default' => '',
                 'desc_tip' => true,
             ],
+            'webhook_url_display' => [
+                'title' => __('Webhook URL', ACOUNTPAY_TEXT_DOMAIN),
+                'type'  => 'webhook_url_display',
+            ],
+            'webhook_health' => [
+                'title' => __('Webhook health', ACOUNTPAY_TEXT_DOMAIN),
+                'type'  => 'webhook_health',
+            ],
+            'test_connection' => [
+                'title' => __('Connection test', ACOUNTPAY_TEXT_DOMAIN),
+                'type'  => 'test_connection',
+            ],
+            'paid_order_status' => [
+                'title' => __('Order status when payment is confirmed', ACOUNTPAY_TEXT_DOMAIN),
+                'type' => 'select',
+                'description' => __('WooCommerce normally moves Pay-by-Bank orders to "Processing" so you can fulfil them. Pick "Completed" if you want orders auto-completed after payment instead (e.g. digital goods).', ACOUNTPAY_TEXT_DOMAIN),
+                'default' => 'default',
+                'options' => [
+                    'default'    => __('Default (Processing for physical, Completed for virtual)', ACOUNTPAY_TEXT_DOMAIN),
+                    'processing' => __('Processing', ACOUNTPAY_TEXT_DOMAIN),
+                    'completed'  => __('Completed', ACOUNTPAY_TEXT_DOMAIN),
+                ],
+                'desc_tip' => true,
+            ],
+            'failed_order_status' => [
+                'title' => __('Order status when payment fails', ACOUNTPAY_TEXT_DOMAIN),
+                'type' => 'select',
+                'description' => __('Where to move orders when AcountPay reports failed / cancelled / expired. "Pending" lets the customer easily retry from My Account; "Failed" matches most A2A providers.', ACOUNTPAY_TEXT_DOMAIN),
+                'default' => 'failed',
+                'options' => [
+                    'failed'  => __('Failed', ACOUNTPAY_TEXT_DOMAIN),
+                    'pending' => __('Pending', ACOUNTPAY_TEXT_DOMAIN),
+                ],
+                'desc_tip' => true,
+            ],
         ]);
         //return form fields to woocommerce
         $this->form_fields = $form_fields;
+    }
+
+    /**
+     * Render the read-only Webhook URL field with a copy button. This is the
+     * single biggest source of integration support tickets — making it visible
+     * (and copy-pasteable) in settings rather than buried in plugin docs.
+     */
+    public function generate_webhook_url_display_html($key, $data)
+    {
+        $field_key   = $this->get_field_key($key);
+        $webhook_url = function_exists('WC') ? esc_url(WC()->api_request_url('acountpay_webhook')) : '';
+        $defaults = array(
+            'title'       => __('Webhook URL', ACOUNTPAY_TEXT_DOMAIN),
+            'description' => __('Paste this URL into your AcountPay Merchant Dashboard → Developer → Webhook URL. AcountPay will POST signed payment status updates here.', ACOUNTPAY_TEXT_DOMAIN),
+        );
+        $data = wp_parse_args($data, $defaults);
+        ob_start();
+        ?>
+        <tr valign="top">
+            <th scope="row" class="titledesc">
+                <label for="<?php echo esc_attr($field_key); ?>"><?php echo esc_html($data['title']); ?></label>
+            </th>
+            <td class="forminp">
+                <input type="text" readonly id="<?php echo esc_attr($field_key); ?>" value="<?php echo esc_attr($webhook_url); ?>" style="width: 100%; max-width: 520px;" onclick="this.select();" />
+                <button type="button" class="button" onclick="navigator.clipboard.writeText(document.getElementById('<?php echo esc_js($field_key); ?>').value); this.textContent='<?php echo esc_js(__('Copied', ACOUNTPAY_TEXT_DOMAIN)); ?>'; setTimeout(()=>{this.textContent='<?php echo esc_js(__('Copy', ACOUNTPAY_TEXT_DOMAIN)); ?>';}, 1500);"><?php esc_html_e('Copy', ACOUNTPAY_TEXT_DOMAIN); ?></button>
+                <p class="description"><?php echo esc_html($data['description']); ?></p>
+            </td>
+        </tr>
+        <?php
+        return ob_get_clean();
+    }
+
+    /**
+     * Show "last webhook seen" status so merchants can verify their webhook
+     * configuration is actually delivering. Pulled from a plugin-wide option
+     * we stamp every time handle_webhook() succeeds.
+     */
+    public function generate_webhook_health_html($key, $data)
+    {
+        $field_key = $this->get_field_key($key);
+        $last      = (int) get_option('acountpay_last_webhook_at', 0);
+        $count     = (int) get_option('acountpay_webhook_count', 0);
+        if ($last > 0) {
+            $age = time() - $last;
+            $fresh = $age < (24 * HOUR_IN_SECONDS);
+            $color = $fresh ? '#0a7d20' : '#a05a00';
+            $bg    = $fresh ? '#d6f4dc' : '#fff1d6';
+            $label = $fresh
+                ? sprintf(__('Last webhook received %s ago', ACOUNTPAY_TEXT_DOMAIN), human_time_diff($last, time()))
+                : sprintf(__('Last webhook received %s ago — check your AcountPay dashboard webhook URL', ACOUNTPAY_TEXT_DOMAIN), human_time_diff($last, time()));
+            $html  = sprintf('<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:%s;color:%s;font-weight:600;">%s</span> <small>%s</small>', esc_attr($bg), esc_attr($color), esc_html($label), esc_html(sprintf(__('(%d total)', ACOUNTPAY_TEXT_DOMAIN), $count)));
+        } else {
+            $html = '<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:#fde2e2;color:#a40000;font-weight:600;">' . esc_html__('No webhook ever received', ACOUNTPAY_TEXT_DOMAIN) . '</span> <small>' . esc_html__('Pay-by-Bank orders won\'t auto-complete until AcountPay can deliver to the URL above.', ACOUNTPAY_TEXT_DOMAIN) . '</small>';
+        }
+        ob_start();
+        ?>
+        <tr valign="top">
+            <th scope="row" class="titledesc">
+                <label><?php echo esc_html($data['title']); ?></label>
+            </th>
+            <td class="forminp"><?php echo $html; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped ?></td>
+        </tr>
+        <?php
+        return ob_get_clean();
+    }
+
+    /**
+     * Render the "Test connection" button that pings the AcountPay API and
+     * shows a green/red pill — same pattern Stripe / TrueLayer use.
+     */
+    public function generate_test_connection_html($key, $data)
+    {
+        $field_key = $this->get_field_key($key);
+        $nonce     = wp_create_nonce('acountpay_test_connection');
+        ob_start();
+        ?>
+        <tr valign="top">
+            <th scope="row" class="titledesc">
+                <label><?php echo esc_html($data['title']); ?></label>
+            </th>
+            <td class="forminp">
+                <button type="button" class="button button-secondary" id="acountpay-test-connection-btn"
+                    data-nonce="<?php echo esc_attr($nonce); ?>"
+                    data-pending="<?php echo esc_attr__('Testing…', ACOUNTPAY_TEXT_DOMAIN); ?>"
+                    data-default="<?php echo esc_attr__('Test connection', ACOUNTPAY_TEXT_DOMAIN); ?>"
+                ><?php esc_html_e('Test connection', ACOUNTPAY_TEXT_DOMAIN); ?></button>
+                <span id="acountpay-test-connection-result" style="margin-left:10px;"></span>
+                <p class="description"><?php esc_html_e('Pings the AcountPay API base URL above. Green = your store can reach AcountPay over HTTPS. Red = network / SSL / firewall problem.', ACOUNTPAY_TEXT_DOMAIN); ?></p>
+                <script>
+                (function(){
+                    var btn = document.getElementById('acountpay-test-connection-btn');
+                    if (!btn) return;
+                    btn.addEventListener('click', function(){
+                        var out = document.getElementById('acountpay-test-connection-result');
+                        out.textContent = '';
+                        btn.disabled = true;
+                        btn.textContent = btn.dataset.pending;
+                        var fd = new FormData();
+                        fd.append('action', 'acountpay_test_connection');
+                        fd.append('_wpnonce', btn.dataset.nonce);
+                        fetch(ajaxurl, { method: 'POST', credentials: 'same-origin', body: fd })
+                            .then(function(r){ return r.json(); })
+                            .then(function(data){
+                                btn.disabled = false;
+                                btn.textContent = btn.dataset.default;
+                                if (data && data.success) {
+                                    out.innerHTML = '<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:#d6f4dc;color:#0a7d20;font-weight:600;">' + (data.data && data.data.message ? data.data.message : 'OK') + '</span>';
+                                } else {
+                                    var msg = (data && data.data && data.data.message) ? data.data.message : 'Request failed';
+                                    out.innerHTML = '<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:#fde2e2;color:#a40000;font-weight:600;">' + msg + '</span>';
+                                }
+                            })
+                            .catch(function(err){
+                                btn.disabled = false;
+                                btn.textContent = btn.dataset.default;
+                                out.innerHTML = '<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:#fde2e2;color:#a40000;font-weight:600;">' + err.message + '</span>';
+                            });
+                    });
+                })();
+                </script>
+            </td>
+        </tr>
+        <?php
+        return ob_get_clean();
+    }
+
+    /**
+     * Admin AJAX: ping AcountPay API to validate base URL + reachability.
+     */
+    public function ajax_test_connection()
+    {
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(array('message' => __('Insufficient permissions', ACOUNTPAY_TEXT_DOMAIN)), 403);
+        }
+        check_ajax_referer('acountpay_test_connection');
+        if (!isset($this->api) || !$this->api) {
+            wp_send_json_error(array('message' => __('API not initialised', ACOUNTPAY_TEXT_DOMAIN)));
+        }
+        $result = $this->api->verify_connection();
+        if (is_wp_error($result)) {
+            wp_send_json_error(array('message' => $result->get_error_message()));
+        }
+        wp_send_json_success(array('message' => __('Connection OK', ACOUNTPAY_TEXT_DOMAIN)));
     }
 
     /**
@@ -336,6 +696,19 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             return;
         }
 
+        // Reuse the previously-issued POS URL if it's still fresh (≤30 min)
+        // and the order hasn't already been completed. This makes the
+        // "Pay" button on the My Account → Orders → Pay page idempotent and
+        // avoids charging a second payment-link create per retry.
+        $stored_url     = (string) $order->get_meta('_acountpay_pos_url');
+        $created_at     = (int) $order->get_meta('_acountpay_link_created_at');
+        $stored_is_fresh = $stored_url !== '' && $created_at > 0 && (time() - $created_at) < 30 * MINUTE_IN_SECONDS;
+        if ($stored_is_fresh && in_array($order->get_status(), array('pending', 'on-hold'), true)) {
+            $this->log_info('receipt_page: reusing existing POS URL', array('order_id' => $order_id));
+            wp_redirect($stored_url);
+            exit;
+        }
+
         $client_id = trim($this->get_option('client_id', ''));
         if (empty($client_id) || !isset($this->api) || !$this->api) {
             echo '<p>' . esc_html__('Payment gateway is not configured. Please contact the store administrator.', ACOUNTPAY_TEXT_DOMAIN) . '</p>';
@@ -348,18 +721,27 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             return;
         }
 
-        $currency = strtoupper($order->get_currency());
-        $callback_url = add_query_arg('order_id', $order_id, WC()->api_request_url('AcountPay_Payment_Gateway'));
-        $webhook_url = add_query_arg('order_id', $order_id, WC()->api_request_url('acountpay_webhook'));
+        $currency         = strtoupper($order->get_currency());
+        $reference_number = (string) $order->get_order_number();
+
+        $idempotency_key = $order->get_meta('_acountpay_idempotency_key');
+        if (empty($idempotency_key)) {
+            $idempotency_key = wp_generate_uuid4();
+            $order->update_meta_data('_acountpay_idempotency_key', $idempotency_key);
+        }
+
+        $callback_url = $this->build_signed_callback_url($order_id, $reference_number, (string) $order->get_meta('_acountpay_payment_id'));
+        $webhook_url  = add_query_arg('order_id', $order_id, WC()->api_request_url('acountpay_webhook'));
 
         $payment_data = array(
             'clientId'        => $client_id,
             'amount'          => $amount,
-            'referenceNumber' => (string) $order->get_order_number(),
+            'referenceNumber' => $reference_number,
             'redirectUrl'     => $callback_url,
             'webhookUrl'      => $webhook_url,
             'description'     => sprintf(__('Payment for order #%s', ACOUNTPAY_TEXT_DOMAIN), $order->get_order_number()),
             'currency'        => $currency,
+            'idempotencyKey'  => $idempotency_key,
         );
 
         $this->log_info('receipt_page: Creating v2 payment link for retry', array('order_id' => $order_id));
@@ -374,6 +756,21 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
 
         $redirect_url = isset($response['redirectUrl']) ? $response['redirectUrl'] : (isset($response['authorizationUrl']) ? $response['authorizationUrl'] : '');
         if (!empty($redirect_url) && is_string($redirect_url) && preg_match('#^https?://#i', $redirect_url)) {
+            if ('yes' === $this->get_option('skip_desktop_qr')) {
+                $redirect_url = add_query_arg('skipDesktopQr', '1', $redirect_url);
+            }
+
+            $payment_id = isset($response['paymentId']) ? (string) $response['paymentId'] : '';
+            if ($payment_id !== '') {
+                $order->update_meta_data('_acountpay_payment_id', $payment_id);
+                $order->set_transaction_id($payment_id);
+                $callback_url = $this->build_signed_callback_url($order_id, $reference_number, $payment_id);
+                $redirect_url = $this->maybe_replace_redirect_callback($redirect_url, $callback_url);
+            }
+            $order->update_meta_data('_acountpay_pos_url', $redirect_url);
+            $order->update_meta_data('_acountpay_link_created_at', time());
+            $order->save();
+
             $this->log_info('receipt_page: Redirecting to POS via v2', array('order_id' => $order_id));
             wp_redirect($redirect_url);
             exit;
@@ -478,7 +875,14 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             echo '<div class="acountpay-description">' . wp_kses_post(wpautop(wptexturize($this->description))) . '</div>';
         }
 
+        // Open-banking redirects only succeed back to an HTTPS origin. Warn
+        // the customer (in shop admin builds) rather than silently breaking.
         if (!is_ssl()) {
+            if (current_user_can('manage_woocommerce')) {
+                echo '<div class="acountpay-ssl-notice" style="padding:8px 12px;background:#fff8e5;border:1px solid #f0c36d;border-radius:4px;margin-top:8px;font-size:13px;">'
+                    . esc_html__('Pay by Bank requires HTTPS. The bank will refuse to redirect customers back to a non-HTTPS site, so payments will fail until SSL is configured. (Only admins see this notice.)', ACOUNTPAY_TEXT_DOMAIN)
+                    . '</div>';
+            }
             return;
         }
 
@@ -490,6 +894,28 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
     }
 
     /**
+     * Thank-you page hint shown while the order is still pending/on-hold so
+     * the customer doesn't think the payment got lost between the bank app
+     * and Woo. Mirrors what Klarna / Trustly / TrueLayer do.
+     */
+    public function render_awaiting_confirmation_notice($order_id)
+    {
+        $order = $order_id ? wc_get_order($order_id) : null;
+        if (!$order || $order->get_payment_method() !== $this->id) {
+            return;
+        }
+        $status = $order->get_status();
+        if (!in_array($status, array('pending', 'on-hold'), true)) {
+            return;
+        }
+        echo '<div class="woocommerce-info acountpay-awaiting" style="margin-top:12px;">'
+            . esc_html__('Thanks! We\'re still waiting for your bank to confirm the payment. This usually only takes a few seconds — this page will refresh automatically once it\'s confirmed.', ACOUNTPAY_TEXT_DOMAIN)
+            . '</div>';
+        // Lightweight auto-refresh so the customer sees the status flip without F5'ing.
+        echo '<script>setTimeout(function(){ location.reload(); }, 8000);</script>';
+    }
+
+    /**
      * Process the payment.
      * Uses v2 payment-link: create payment with callback URL, redirect customer to AcountPay POS to select bank.
      *
@@ -498,10 +924,6 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
      */
     public function process_payment($order_id)
     {
-        if (is_user_logged_in() && isset($_POST['wc-' . $this->id . '-new-payment-method']) && true === (bool) $_POST['wc-' . $this->id . '-new-payment-method'] && $this->saved_cards) {
-            update_post_meta($order_id, '_wc_monnify_save_card', true);
-        }
-
         $order = wc_get_order($order_id);
         if (!$order) {
             wc_add_notice(__('Order not found.', ACOUNTPAY_TEXT_DOMAIN), 'error');
@@ -511,7 +933,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         $client_id = trim($this->get_option('client_id', ''));
         if (empty($client_id)) {
             $this->log_error('process_payment: Client ID is missing');
-            wc_add_notice(__('AcountPay is not configured. Please set your Client ID in the payment settings.', ACOUNTPAY_TEXT_DOMAIN), 'error');
+            wc_add_notice(__('Pay by Bank is not configured. Please set your Client ID in the payment settings.', ACOUNTPAY_TEXT_DOMAIN), 'error');
             return array('result' => 'failure', 'redirect' => wc_get_checkout_url());
         }
 
@@ -533,19 +955,28 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         }
         $currency = strtoupper($currency);
 
-        $callback_url = add_query_arg('order_id', $order_id, WC()->api_request_url('AcountPay_Payment_Gateway'));
-        $webhook_url = add_query_arg('order_id', $order_id, WC()->api_request_url('acountpay_webhook'));
+        // Stable per-order idempotency key — prevents two "Place Order" clicks
+        // from creating two different payment links for the same Woo order.
+        $idempotency_key = $order->get_meta('_acountpay_idempotency_key');
+        if (empty($idempotency_key)) {
+            $idempotency_key = wp_generate_uuid4();
+            $order->update_meta_data('_acountpay_idempotency_key', $idempotency_key);
+        }
+
         $reference_number = (string) $order->get_order_number();
-        $description = sprintf(__('Payment for order #%s', ACOUNTPAY_TEXT_DOMAIN), $order->get_order_number());
+        $description      = sprintf(__('Payment for order #%s', ACOUNTPAY_TEXT_DOMAIN), $order->get_order_number());
+        $callback_url     = $this->build_signed_callback_url($order_id, $reference_number);
+        $webhook_url      = add_query_arg('order_id', $order_id, WC()->api_request_url('acountpay_webhook'));
 
         $payment_data = array(
-            'clientId' => $client_id,
-            'amount' => $amount,
+            'clientId'        => $client_id,
+            'amount'          => $amount,
             'referenceNumber' => $reference_number,
-            'redirectUrl' => $callback_url,
-            'webhookUrl' => $webhook_url,
-            'description' => $description,
-            'currency' => $currency,
+            'redirectUrl'     => $callback_url,
+            'webhookUrl'      => $webhook_url,
+            'description'     => $description,
+            'currency'        => $currency,
+            'idempotencyKey'  => $idempotency_key,
         );
 
         $response = $this->api->create_payment_link_v2($payment_data);
@@ -555,8 +986,6 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             wc_add_notice($response->get_error_message(), 'error');
             return array('result' => 'failure', 'redirect' => wc_get_checkout_url());
         }
-
-        // Guard against non-array or invalid redirect (e.g. API returning "-1" or scalar)
         if (!is_array($response)) {
             $this->log_error('process_payment: invalid response type', array('order_id' => $order_id, 'type' => gettype($response)));
             wc_add_notice(__('Payment could not be started. Please try again.', ACOUNTPAY_TEXT_DOMAIN), 'error');
@@ -570,19 +999,104 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             return array('result' => 'failure', 'redirect' => wc_get_checkout_url());
         }
 
-        // Mark the order as pending until the callback + webhook confirm payment.
-        // Without this, an abandoned payment would leave the order in its default post-checkout state.
-        if ($order->get_status() !== 'pending') {
-            $order->update_status('pending', __('Awaiting AcountPay confirmation.', ACOUNTPAY_TEXT_DOMAIN));
-        } else {
-            $order->add_order_note(__('Awaiting AcountPay confirmation.', ACOUNTPAY_TEXT_DOMAIN));
+        if ('yes' === $this->get_option('skip_desktop_qr')) {
+            $redirect_to_pos = add_query_arg('skipDesktopQr', '1', $redirect_to_pos);
         }
 
-        $this->log_info('process_payment: redirecting to POS', array('order_id' => $order_id));
+        // Persist payment metadata on the order so the admin meta box, the
+        // callback verifier and the webhook handler can cross-reference it.
+        $payment_id = isset($response['paymentId']) ? (string) $response['paymentId'] : '';
+        if ($payment_id !== '') {
+            $order->update_meta_data('_acountpay_payment_id', $payment_id);
+            $order->set_transaction_id($payment_id);
+            // Re-sign the callback URL with the now-known payment id.
+            $callback_url    = $this->build_signed_callback_url($order_id, $reference_number, $payment_id);
+            $redirect_to_pos = $this->maybe_replace_redirect_callback($redirect_to_pos, $callback_url);
+        }
+        $order->update_meta_data('_acountpay_reference_number', $reference_number);
+        $order->update_meta_data('_acountpay_pos_url', $redirect_to_pos);
+        $order->update_meta_data('_acountpay_currency', $currency);
+        $order->update_meta_data('_acountpay_amount', (string) $amount);
+        $order->update_meta_data('_acountpay_status', 'created');
+        $order->update_meta_data('_acountpay_link_created_at', time());
+
+        // Mark the order as pending until the callback + webhook confirm payment.
+        if ($order->get_status() !== 'pending') {
+            $order->update_status('pending', __('Awaiting Pay by Bank confirmation.', ACOUNTPAY_TEXT_DOMAIN));
+        } else {
+            $order->add_order_note(__('Awaiting Pay by Bank confirmation.', ACOUNTPAY_TEXT_DOMAIN));
+        }
+        $order->save();
+
+        $this->log_info('process_payment: redirecting to POS', array('order_id' => $order_id, 'payment_id' => $payment_id));
         return array(
-            'result' => 'success',
+            'result'   => 'success',
             'redirect' => $redirect_to_pos,
         );
+    }
+
+    /**
+     * Build a signed callback URL containing order_id, reference, payment id
+     * (when known), a timestamp and an HMAC-SHA256 token over those fields.
+     * Without this, anyone could call /wc-api/AcountPay_Payment_Gateway?order_id=N&status=failed
+     * to flip another customer's order to failed.
+     */
+    protected function build_signed_callback_url($order_id, $reference_number = '', $payment_id = '')
+    {
+        $url = WC()->api_request_url('AcountPay_Payment_Gateway');
+        $ts  = time();
+        $ref = (string) $reference_number;
+        $pid = (string) $payment_id;
+        $url = add_query_arg(array(
+            'order_id'  => (int) $order_id,
+            'ref'       => rawurlencode($ref),
+            'pid'       => rawurlencode($pid),
+            'ts'        => $ts,
+        ), $url);
+        $secret = trim((string) $this->get_option('webhook_signing_secret', ''));
+        if ($secret !== '') {
+            $token = hash_hmac('sha256', $order_id . '|' . $ref . '|' . $pid . '|' . $ts, $secret);
+            $url   = add_query_arg('token', $token, $url);
+        }
+        return $url;
+    }
+
+    /**
+     * If AcountPay built the POS URL by injecting our callback into a query
+     * arg (e.g. ?callbackUrl=...), update that arg to the freshly-signed URL
+     * once we know the payment id. Falls back to leaving the URL alone if it
+     * doesn't carry a callback param.
+     */
+    protected function maybe_replace_redirect_callback($pos_url, $new_callback_url)
+    {
+        if (!is_string($pos_url) || $pos_url === '') {
+            return $pos_url;
+        }
+        $parts = wp_parse_url($pos_url);
+        if (empty($parts['query'])) {
+            return $pos_url;
+        }
+        parse_str($parts['query'], $q);
+        $candidates = array('callbackUrl', 'callback_url', 'redirectUrl', 'redirect_url', 'returnUrl', 'return_url');
+        $changed = false;
+        foreach ($candidates as $param) {
+            if (isset($q[$param])) {
+                $q[$param] = $new_callback_url;
+                $changed = true;
+            }
+        }
+        if (!$changed) {
+            return $pos_url;
+        }
+        $rebuilt = (isset($parts['scheme']) ? $parts['scheme'] . '://' : '')
+            . (isset($parts['host']) ? $parts['host'] : '')
+            . (isset($parts['port']) ? ':' . $parts['port'] : '')
+            . (isset($parts['path']) ? $parts['path'] : '')
+            . '?' . http_build_query($q);
+        if (!empty($parts['fragment'])) {
+            $rebuilt .= '#' . $parts['fragment'];
+        }
+        return $rebuilt;
     }
 
     /**
@@ -594,158 +1108,156 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         try {
             $this->log_info('Payment callback received');
 
-            // Get the order id
             $order_id = isset($_GET['order_id']) ? absint($_GET['order_id']) : 0;
-            
+            $url_ref  = isset($_GET['ref']) ? sanitize_text_field(wp_unslash($_GET['ref'])) : '';
+            $url_pid  = isset($_GET['pid']) ? sanitize_text_field(wp_unslash($_GET['pid'])) : '';
+            $url_ts   = isset($_GET['ts']) ? absint($_GET['ts']) : 0;
+            $url_tok  = isset($_GET['token']) ? sanitize_text_field(wp_unslash($_GET['token'])) : '';
+
             if (!$order_id) {
-                $this->log_error('Payment callback: Order ID is missing');
                 throw new Exception(__('Order ID is required.', ACOUNTPAY_TEXT_DOMAIN));
             }
 
-            $this->log_info('Payment callback: Processing order', array('order_id' => $order_id));
-
-            // Get the order
             $order = wc_get_order($order_id);
-
             if (!$order) {
-                $this->log_error('Payment callback: Order not found', array('order_id' => $order_id));
                 throw new Exception(__('Order not found.', ACOUNTPAY_TEXT_DOMAIN));
             }
 
-            // Check if payment intent ID exists in order meta
-            $payment_intent_id = $order->get_meta('_acountpay_payment_intent_id');
-            
-            if (empty($payment_intent_id)) {
-                // Payment intent might be in GET parameters
-                $payment_intent_id = isset($_GET['payment_intent_id']) ? sanitize_text_field($_GET['payment_intent_id']) : '';
+            // Reject if this order isn't actually a Pay-by-Bank order. Stops
+            // a leaked URL from another site marking a non-AP order paid.
+            if ($order->get_payment_method() !== $this->id) {
+                $this->log_error('Payment callback: gateway mismatch', array('order_id' => $order_id, 'method' => $order->get_payment_method()));
+                throw new Exception(__('Invalid payment session.', ACOUNTPAY_TEXT_DOMAIN));
             }
 
-            // If we have a payment intent ID, we can verify the payment
-            // For now, we'll check if the order is already completed
-            if ($order->get_status() === 'completed' || $order->get_status() === 'processing') {
-                $this->log_info('Payment callback: Order already processed', array(
-                    'order_id' => $order_id,
-                    'status' => $order->get_status()
-                ));
-                // Order already processed, redirect to thank you page
-                    wp_safe_redirect($order->get_checkout_order_received_url());
-                    exit;
+            // HMAC verification of the callback URL. Without this, anyone can
+            // hit /wc-api/AcountPay_Payment_Gateway?order_id=X&status=success
+            // and try to flip an order. We always require a token when a
+            // signing secret is configured.
+            $signing_secret = trim((string) $this->get_option('webhook_signing_secret', ''));
+            if ($signing_secret !== '') {
+                if ($url_tok === '' || $url_ts <= 0) {
+                    $this->log_error('Payment callback: missing token/ts', array('order_id' => $order_id));
+                    throw new Exception(__('Invalid or expired payment confirmation link.', ACOUNTPAY_TEXT_DOMAIN));
                 }
+                // 24h grace — bank redirects can take a long time on mobile.
+                if (abs(time() - $url_ts) > DAY_IN_SECONDS) {
+                    $this->log_error('Payment callback: expired token', array('order_id' => $order_id, 'ts' => $url_ts));
+                    throw new Exception(__('Payment confirmation link has expired. Please retry the payment.', ACOUNTPAY_TEXT_DOMAIN));
+                }
+                $expected = hash_hmac('sha256', $order_id . '|' . $url_ref . '|' . $url_pid . '|' . $url_ts, $signing_secret);
+                if (!hash_equals($expected, $url_tok)) {
+                    $this->log_error('Payment callback: invalid token', array('order_id' => $order_id));
+                    throw new Exception(__('Invalid payment confirmation link.', ACOUNTPAY_TEXT_DOMAIN));
+                }
+                // Cross-check pid against stored payment id when both are known.
+                $stored_pid = (string) $order->get_meta('_acountpay_payment_id');
+                if ($stored_pid !== '' && $url_pid !== '' && $stored_pid !== $url_pid) {
+                    $this->log_error('Payment callback: pid mismatch', array('order_id' => $order_id, 'stored' => $stored_pid, 'url' => $url_pid));
+                    throw new Exception(__('Invalid payment session.', ACOUNTPAY_TEXT_DOMAIN));
+                }
+            }
 
-            // Check for payment status in GET parameters
-            $payment_status = isset($_GET['status']) ? sanitize_text_field($_GET['status']) : '';
-            
-            $this->log_info('Payment callback: Payment status', array(
-                'order_id' => $order_id,
-                'payment_status' => $payment_status,
-                'payment_intent_id' => $payment_intent_id
-            ));
-            
-            if (in_array($payment_status, array('success', 'completed', 'paid', 'settled'), true)) {
-                // Server-side verification: confirm the payment status with the backend
-                $verified = false;
-                if (isset($this->api) && $this->api) {
-                    $reference = (string) $order->get_order_number();
-                    $verify_result = $this->api->verify_payment_status($reference);
-                    if (!is_wp_error($verify_result) && is_array($verify_result)) {
-                        $backend_status = isset($verify_result['status']) ? $verify_result['status'] : '';
-                        if (in_array($backend_status, array('paid', 'settled', 'completed', 'processing', 'processed'), true)) {
-                            $verified = true;
-                            $this->log_info('Payment callback: Server-side verification passed', array('order_id' => $order_id, 'backend_status' => $backend_status));
-                        } else {
-                            $this->log_warning('Payment callback: Backend status mismatch', array(
-                                'order_id' => $order_id,
-                                'url_status' => $payment_status,
-                                'backend_status' => $backend_status,
-                            ));
-                        }
-                    } else {
-                        $this->log_warning('Payment callback: Backend verification failed, trusting redirect status', array('order_id' => $order_id));
-                        $verified = true;
-                    }
-                } else {
-                    $verified = true;
-                }
-
-                if ($verified) {
-                    $this->log_info('Payment callback: Payment successful', array('order_id' => $order_id, 'status' => $payment_status));
-                    wc_add_notice(__('Payment successful using AcountPay Payment Gateway, thank you for your order.', ACOUNTPAY_TEXT_DOMAIN), 'success');
-                    
-                    $order->add_order_note(sprintf(__('Payment successful via AcountPay (status: %s, verified).', ACOUNTPAY_TEXT_DOMAIN), $payment_status));
-                    // payment_complete() handles the transition (pending/on-hold/failed -> processing/completed) and fires downstream hooks.
-                    $order->payment_complete();
-                } else {
-                    $this->log_warning('Payment callback: Verification failed, setting order on-hold', array('order_id' => $order_id));
-                    $order->add_order_note(__('Payment callback received with success status but backend verification did not confirm. Order set to on-hold pending webhook confirmation.', ACOUNTPAY_TEXT_DOMAIN));
-                    $order->update_status('on-hold', __('Awaiting payment verification from AcountPay.', ACOUNTPAY_TEXT_DOMAIN));
-                }
-
-                wp_safe_redirect($order->get_checkout_order_received_url());
-                exit;
-            } elseif ($payment_status === 'processing' || $payment_status === 'pending') {
-                // The bank redirect often arrives before the final webhook updates the payment status.
-                // Check the backend to see if the payment has actually completed by now.
-                $this->log_info('Payment callback: Status is processing/pending, checking backend for final status', array('order_id' => $order_id));
-                
-                $actual_status = $payment_status;
-                if (isset($this->api) && $this->api) {
-                    // Small delay to let the webhook finish processing
-                    sleep(2);
-                    $reference = (string) $order->get_order_number();
-                    $verify_result = $this->api->verify_payment_status($reference);
-                    if (!is_wp_error($verify_result) && is_array($verify_result)) {
-                        $backend_status = isset($verify_result['status']) ? $verify_result['status'] : '';
-                        $this->log_info('Payment callback: Backend status check', array('order_id' => $order_id, 'backend_status' => $backend_status));
-                        if (in_array($backend_status, array('paid', 'settled', 'completed'), true)) {
-                            $actual_status = 'paid';
-                        }
-                    }
-                }
-
-                if ($actual_status === 'paid') {
-                    $this->log_info('Payment callback: Backend confirms payment is complete', array('order_id' => $order_id));
-                    wc_add_notice(__('Payment successful using AcountPay Payment Gateway, thank you for your order.', ACOUNTPAY_TEXT_DOMAIN), 'success');
-                    $order->add_order_note(__('Payment confirmed via AcountPay (redirect status was pending, backend confirmed paid).', ACOUNTPAY_TEXT_DOMAIN));
-                    $order->payment_complete();
-                } else {
-                    $order->add_order_note(__('Payment is being processed by the bank. Status will update automatically via webhook.', ACOUNTPAY_TEXT_DOMAIN));
-                    $order->update_status('on-hold', __('Awaiting payment confirmation from AcountPay.', ACOUNTPAY_TEXT_DOMAIN));
-                }
-                
-                wp_safe_redirect($order->get_checkout_order_received_url());
-                exit;
-            } elseif (in_array($payment_status, array('failed', 'cancelled', 'rejected', 'failure_expired'), true)) {
-                $this->log_info('Payment callback: Payment failed or cancelled', array('order_id' => $order_id, 'status' => $payment_status));
-                $order->update_status('failed', sprintf(__('Payment %s via AcountPay.', ACOUNTPAY_TEXT_DOMAIN), $payment_status));
-                wc_add_notice(__('Payment failed. Please try again or choose another payment method.', ACOUNTPAY_TEXT_DOMAIN), 'error');
-                
-                wp_safe_redirect($order->get_checkout_payment_url(true));
-                exit;
-            } else {
-                $this->log_warning('Payment callback: Unknown or missing status', array('order_id' => $order_id, 'status' => $payment_status));
-                $order->add_order_note(__('Payment callback received without a recognized status. Awaiting webhook confirmation.', ACOUNTPAY_TEXT_DOMAIN));
-                $order->update_status('on-hold', __('Awaiting payment confirmation from AcountPay.', ACOUNTPAY_TEXT_DOMAIN));
-                
+            // Already final? Just bounce to the thank-you page.
+            if (in_array($order->get_status(), array('completed', 'processing', 'refunded'), true)) {
                 wp_safe_redirect($order->get_checkout_order_received_url());
                 exit;
             }
-            
-        } catch (Exception $e) {
-            // Log error
-            $this->log_error('Payment callback: Exception occurred', array(
-                'message' => $e->getMessage(),
-                'trace' => $e->getTraceAsString()
-            ));
-            
-            // Checkout URL
-            $checkout_url = wc_get_checkout_url();
-            
-            // Add error message
-            wc_add_notice($e->getMessage(), 'error');
-            
-            // Redirect to checkout
-            wp_safe_redirect($checkout_url);
+
+            // Treat the URL `status` as a HINT only — the source of truth is
+            // the backend verification call (and the signed webhook). Bank
+            // redirects can arrive with stale or even forged status values.
+            $url_status = isset($_GET['status']) ? sanitize_text_field(wp_unslash($_GET['status'])) : '';
+            $this->log_info('Payment callback: verifying with backend', array('order_id' => $order_id, 'url_status' => $url_status));
+
+            $backend_status = '';
+            if (isset($this->api) && $this->api) {
+                $reference = (string) $order->get_meta('_acountpay_reference_number');
+                if ($reference === '') {
+                    $reference = (string) $order->get_order_number();
+                }
+                $verify_result = $this->api->verify_payment_status($reference);
+                if (!is_wp_error($verify_result) && is_array($verify_result)) {
+                    $backend_status = isset($verify_result['status']) ? (string) $verify_result['status'] : '';
+                    $this->log_info('Payment callback: backend status', array('order_id' => $order_id, 'backend_status' => $backend_status));
+                } else {
+                    $this->log_warning('Payment callback: backend verification failed', array('order_id' => $order_id, 'error' => is_wp_error($verify_result) ? $verify_result->get_error_message() : 'invalid response'));
+                }
+            }
+
+            $is_paid     = in_array($backend_status, array('paid', 'settled', 'completed', 'processed'), true);
+            $is_pending  = in_array($backend_status, array('pending', 'processing', 'authorized', ''), true);
+            $is_failed   = in_array($backend_status, array('failed', 'rejected', 'failure_expired'), true);
+            $is_refunded = in_array($backend_status, array('refunded', 'partially_refunded'), true);
+
+            if ($is_paid) {
+                wc_add_notice(__('Payment successful, thank you for your order.', ACOUNTPAY_TEXT_DOMAIN), 'success');
+                $order->add_order_note(sprintf(__('Pay by Bank: payment confirmed via callback (backend status: %s).', ACOUNTPAY_TEXT_DOMAIN), $backend_status));
+                $order->payment_complete((string) $order->get_meta('_acountpay_payment_id'));
+                $this->maybe_apply_paid_status_mapping($order);
+                wp_safe_redirect($order->get_checkout_order_received_url());
+                exit;
+            }
+
+            if ($is_refunded) {
+                $order->add_order_note(__('Pay by Bank: backend reports payment as refunded.', ACOUNTPAY_TEXT_DOMAIN));
+                $order->update_status('refunded', __('Refunded via Pay by Bank.', ACOUNTPAY_TEXT_DOMAIN));
+                wp_safe_redirect($order->get_checkout_order_received_url());
+                exit;
+            }
+
+            if ($is_failed) {
+                $this->apply_failed_status($order, $backend_status ?: $url_status);
+                wc_add_notice(__('Payment failed or was cancelled. Please try again.', ACOUNTPAY_TEXT_DOMAIN), 'error');
+                wp_safe_redirect(wc_get_checkout_url());
+                exit;
+            }
+
+            // Pending: stay on-hold and let the webhook close it out. Show
+            // the customer the thank-you page with the awaiting-confirmation
+            // banner instead of dropping them back onto checkout.
+            $order->add_order_note(__('Pay by Bank: bank redirect arrived before final status. Awaiting webhook confirmation.', ACOUNTPAY_TEXT_DOMAIN));
+            if (!in_array($order->get_status(), array('on-hold', 'pending'), true)) {
+                $order->update_status('on-hold', __('Awaiting payment confirmation from the bank.', ACOUNTPAY_TEXT_DOMAIN));
+            }
+            wp_safe_redirect($order->get_checkout_order_received_url());
             exit;
+        } catch (Exception $e) {
+            $this->log_error('Payment callback: exception', array('message' => $e->getMessage()));
+            wc_add_notice($e->getMessage(), 'error');
+            wp_safe_redirect(wc_get_checkout_url());
+            exit;
+        }
+    }
+
+    /**
+     * Honor the "Order status when payment is confirmed" setting after
+     * payment_complete() has already run (which only ever picks
+     * processing/completed automatically).
+     */
+    protected function maybe_apply_paid_status_mapping($order)
+    {
+        $mapping = $this->get_option('paid_order_status', 'default');
+        if ($mapping === 'completed' && $order->get_status() !== 'completed') {
+            $order->update_status('completed', __('Auto-completed (Pay by Bank setting).', ACOUNTPAY_TEXT_DOMAIN));
+        } elseif ($mapping === 'processing' && $order->get_status() !== 'processing') {
+            $order->update_status('processing', __('Forced to processing (Pay by Bank setting).', ACOUNTPAY_TEXT_DOMAIN));
+        }
+    }
+
+    /**
+     * Apply the failure status mapping (failed vs pending).
+     */
+    protected function apply_failed_status($order, $reason = '')
+    {
+        $target = $this->get_option('failed_order_status', 'failed') === 'pending' ? 'pending' : 'failed';
+        $note   = $reason !== ''
+            ? sprintf(__('Pay by Bank: payment %s.', ACOUNTPAY_TEXT_DOMAIN), $reason)
+            : __('Pay by Bank: payment was not completed.', ACOUNTPAY_TEXT_DOMAIN);
+        if ($order->get_status() !== $target) {
+            $order->update_status($target, $note);
+        } else {
+            $order->add_order_note($note);
         }
     }
 
@@ -764,24 +1276,26 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             return;
         }
 
-        $signature = isset($_SERVER['HTTP_X_ACOUNTPAY_SIGNATURE']) ? sanitize_text_field(wp_unslash($_SERVER['HTTP_X_ACOUNTPAY_SIGNATURE'])) : '';
+        // The backend sends the signature as `X-AcountPay-Signature` (PHP
+        // surfaces it as HTTP_X_ACOUNTPAY_SIGNATURE). Some proxies normalise
+        // header casing differently — accept both common spellings.
+        $signature = '';
+        if (isset($_SERVER['HTTP_X_ACOUNTPAY_SIGNATURE'])) {
+            $signature = sanitize_text_field(wp_unslash($_SERVER['HTTP_X_ACOUNTPAY_SIGNATURE']));
+        } elseif (isset($_SERVER['HTTP_X_ACCOUNTPAY_SIGNATURE'])) {
+            $signature = sanitize_text_field(wp_unslash($_SERVER['HTTP_X_ACCOUNTPAY_SIGNATURE']));
+        }
 
         $signing_secret = trim((string) $this->get_option('webhook_signing_secret', ''));
         if ($signing_secret === '') {
-            // Fail closed. If no secret is configured the plugin cannot verify
-            // that a POST is really from AcountPay, so anyone who knows the
-            // wc-api URL could mark orders as paid. Merchants must paste the
-            // value shown in their Merchant Dashboard → Developer page.
-            $this->log_error('Webhook: Rejected — webhook signing secret not configured in plugin settings', array(
-                'order_id' => isset($_GET['order_id']) ? absint($_GET['order_id']) : 0,
-            ));
+            $this->log_error('Webhook: Rejected — webhook signing secret not configured in plugin settings');
             wp_send_json(array('received' => false, 'error' => 'signing secret not configured'), 401);
             return;
         }
 
         $expected = 'sha256=' . hash_hmac('sha256', $raw_body, $signing_secret);
-        if ($signature === '' || ! hash_equals($expected, $signature)) {
-            $this->log_error('Webhook: Invalid or missing signature', array('order_id' => isset($_GET['order_id']) ? absint($_GET['order_id']) : 0));
+        if ($signature === '' || !hash_equals($expected, $signature)) {
+            $this->log_error('Webhook: Invalid or missing signature');
             wp_send_json(array('received' => false, 'error' => 'invalid signature'), 401);
             return;
         }
@@ -793,66 +1307,397 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             return;
         }
 
-        $order_id = isset($_GET['order_id']) ? absint($_GET['order_id']) : 0;
-        $status = isset($data['status']) ? sanitize_text_field($data['status']) : '';
-        $reference_number = isset($data['referenceNumber']) ? sanitize_text_field($data['referenceNumber']) : '';
-
-        $this->log_info('Webhook: Processing', array(
-            'order_id' => $order_id,
-            'status' => $status,
-            'reference' => $reference_number,
-        ));
-
-        if (!$order_id) {
-            $this->log_error('Webhook: No order_id in query string');
-            wp_send_json(array('received' => true, 'error' => 'missing order_id'), 400);
-            return;
+        // Dedup by event id when present. AcountPay may retry deliveries on
+        // 5xx — we don't want a second delivery to e.g. fire payment_complete
+        // again or replay a refund.
+        $event_id = isset($data['eventId']) ? sanitize_text_field((string) $data['eventId']) : '';
+        if ($event_id !== '') {
+            $seen_key = 'acountpay_webhook_seen_' . md5($event_id);
+            if (get_transient($seen_key)) {
+                $this->log_info('Webhook: duplicate event, ignoring', array('event_id' => $event_id));
+                wp_send_json(array('received' => true, 'duplicate' => true));
+                return;
+            }
+            set_transient($seen_key, 1, DAY_IN_SECONDS);
         }
 
-        $order = wc_get_order($order_id);
+        // Trust the signed body, not query-string `order_id` (which is just a
+        // routing hint and can be tampered with by the caller). Resolve the
+        // order from referenceNumber → paymentId → query order_id, in order.
+        $reference_number = isset($data['referenceNumber']) ? sanitize_text_field((string) $data['referenceNumber']) : '';
+        $payment_id       = isset($data['paymentId']) ? sanitize_text_field((string) $data['paymentId']) : '';
+        $event            = isset($data['event']) ? sanitize_text_field((string) $data['event']) : 'payment.status_changed';
+        $status           = isset($data['status']) ? sanitize_text_field((string) $data['status']) : '';
+        $internal_status  = isset($data['internalStatus']) ? sanitize_text_field((string) $data['internalStatus']) : '';
+        $amount           = isset($data['amount']) ? floatval($data['amount']) : null;
+        $currency         = isset($data['currency']) ? strtoupper(sanitize_text_field((string) $data['currency'])) : '';
+        $refunded_amount  = isset($data['refundedAmount']) ? floatval($data['refundedAmount']) : null;
+
+        $order = $this->resolve_order_from_webhook($reference_number, $payment_id);
+        if (!$order && isset($_GET['order_id'])) {
+            $order = wc_get_order(absint($_GET['order_id']));
+            if ($order && $order->get_payment_method() !== $this->id) {
+                $order = null;
+            }
+        }
         if (!$order) {
-            $this->log_error('Webhook: Order not found', array('order_id' => $order_id));
+            $this->log_error('Webhook: Order not resolvable', array('reference' => $reference_number, 'paymentId' => $payment_id));
             wp_send_json(array('received' => true, 'error' => 'order not found'), 404);
             return;
         }
 
-        // Don't regress orders that are already in a final state
+        // Belt-and-braces: only act on AP-paid orders.
+        if ($order->get_payment_method() !== $this->id) {
+            $this->log_error('Webhook: gateway mismatch on resolved order', array('order_id' => $order->get_id(), 'method' => $order->get_payment_method()));
+            wp_send_json(array('received' => true, 'error' => 'gateway mismatch'), 200);
+            return;
+        }
+
+        // Amount/currency sanity check — refuse to mark an order paid if the
+        // backend says "DKK 1.00" but the order is "EUR 199.00".
+        if ($amount !== null && $amount > 0) {
+            $expected_amount   = (float) $order->get_total();
+            $expected_currency = strtoupper((string) $order->get_currency());
+            $amount_close      = abs($expected_amount - $amount) <= 0.01;
+            $currency_ok       = ($currency === '' || $currency === $expected_currency);
+            $is_success_event  = in_array($status, array('success', 'paid', 'settled', 'completed'), true);
+            if ($is_success_event && (!$amount_close || !$currency_ok)) {
+                $msg = sprintf(
+                    __('Pay by Bank: refusing to mark paid — amount/currency mismatch. Order expects %1$s %2$s, webhook reported %3$s %4$s.', ACOUNTPAY_TEXT_DOMAIN),
+                    number_format($expected_amount, 2),
+                    $expected_currency,
+                    number_format($amount, 2),
+                    $currency
+                );
+                $this->log_error('Webhook: amount/currency mismatch', array(
+                    'order_id'          => $order->get_id(),
+                    'expected_amount'   => $expected_amount,
+                    'reported_amount'   => $amount,
+                    'expected_currency' => $expected_currency,
+                    'reported_currency' => $currency,
+                ));
+                $order->add_order_note($msg);
+                $order->update_status('on-hold', $msg);
+                wp_send_json(array('received' => true, 'mismatch' => true));
+                return;
+            }
+        }
+
+        // Stamp metadata so the admin meta box is informative.
+        if ($payment_id !== '' && $order->get_meta('_acountpay_payment_id') === '') {
+            $order->update_meta_data('_acountpay_payment_id', $payment_id);
+            $order->set_transaction_id($payment_id);
+        }
+        $order->update_meta_data('_acountpay_last_webhook_at', time());
+        $order->update_meta_data('_acountpay_last_webhook_event', $event);
+        if ($internal_status !== '') {
+            $order->update_meta_data('_acountpay_status', $internal_status);
+        }
+
+        // Plugin-wide health markers (used by the settings "Webhook health" pill).
+        update_option('acountpay_last_webhook_at', time(), false);
+        update_option('acountpay_webhook_count', ((int) get_option('acountpay_webhook_count', 0)) + 1, false);
+
         $current_status = $order->get_status();
-        if (in_array($current_status, array('completed', 'refunded'), true)) {
-            $this->log_info('Webhook: Order already in final state', array('order_id' => $order_id, 'current' => $current_status));
+
+        // Refund events first — they can arrive against an already-completed order.
+        $is_refund_event = in_array($event, array('payment.refunded', 'payment.partially_refunded'), true)
+            || in_array($status, array('refunded', 'partially_refunded'), true)
+            || in_array($internal_status, array('refunded', 'partially_refunded'), true);
+
+        if ($is_refund_event) {
+            $is_partial = ($event === 'payment.partially_refunded') || ($internal_status === 'partially_refunded') || ($status === 'partially_refunded');
+            if ($refunded_amount !== null && $refunded_amount > 0) {
+                $order->update_meta_data('_acountpay_refunded_amount', (string) $refunded_amount);
+            }
+            $note = $is_partial
+                ? sprintf(__('Pay by Bank: partially refunded (%1$s %2$s).', ACOUNTPAY_TEXT_DOMAIN), $refunded_amount !== null ? number_format($refunded_amount, 2) : '?', $currency ?: $order->get_currency())
+                : sprintf(__('Pay by Bank: refunded (%1$s %2$s).', ACOUNTPAY_TEXT_DOMAIN), $refunded_amount !== null ? number_format($refunded_amount, 2) : (string) $order->get_total(), $currency ?: $order->get_currency());
+            $order->add_order_note($note);
+            // Only WC's "refunded" status is fully terminal; "partially refunded"
+            // doesn't exist as a core status, so we just leave the order in
+            // its prior state and rely on the order note + meta for now.
+            if (!$is_partial && $order->get_status() !== 'refunded') {
+                $order->update_status('refunded', $note);
+            }
+            $order->save();
+            wp_send_json(array('received' => true, 'updated' => true, 'kind' => 'refund'));
+            return;
+        }
+
+        // Don't regress orders that are already in a final paid state.
+        if (in_array($current_status, array('completed'), true)) {
+            $order->save();
+            $this->log_info('Webhook: Order already final, only meta refreshed', array('order_id' => $order->get_id(), 'current' => $current_status));
             wp_send_json(array('received' => true, 'already_final' => true));
             return;
         }
 
-        $amount = isset($data['amount']) ? floatval($data['amount']) : null;
-        $currency = isset($data['currency']) ? sanitize_text_field($data['currency']) : '';
-
-        if ($status === 'success' || $status === 'paid' || $status === 'settled' || $status === 'completed') {
-            if ($current_status !== 'processing') {
-                $order->add_order_note(sprintf(
-                    __('Payment confirmed via AcountPay webhook (status: %s, amount: %s %s).', ACOUNTPAY_TEXT_DOMAIN),
-                    $status,
-                    $amount !== null ? number_format($amount, 2) : 'N/A',
-                    $currency
-                ));
-                $order->payment_complete();
+        if (in_array($status, array('success', 'paid', 'settled', 'completed'), true)) {
+            $order->add_order_note(sprintf(
+                __('Pay by Bank: payment confirmed via webhook (status: %1$s, amount: %2$s %3$s).', ACOUNTPAY_TEXT_DOMAIN),
+                $status,
+                $amount !== null ? number_format($amount, 2) : 'N/A',
+                $currency ?: $order->get_currency()
+            ));
+            if ($current_status !== 'processing' && $current_status !== 'completed') {
+                $order->payment_complete($payment_id);
             }
-        } elseif ($status === 'failed' || $status === 'rejected') {
+            $this->maybe_apply_paid_status_mapping($order);
+        } elseif (in_array($status, array('failed', 'rejected'), true) || in_array($internal_status, array('failed', 'failure_expired', 'rejected'), true)) {
             if (!in_array($current_status, array('processing', 'completed'), true)) {
-                $order->add_order_note(sprintf(
-                    __('Payment %s via AcountPay webhook.', ACOUNTPAY_TEXT_DOMAIN),
-                    $status
-                ));
-                $order->update_status('failed', sprintf(__('Payment %s via AcountPay webhook.', ACOUNTPAY_TEXT_DOMAIN), $status));
+                $this->apply_failed_status($order, $status ?: $internal_status);
             }
         } else {
             $order->add_order_note(sprintf(
-                __('AcountPay webhook received with status: %s.', ACOUNTPAY_TEXT_DOMAIN),
+                __('Pay by Bank webhook received (event: %1$s, status: %2$s).', ACOUNTPAY_TEXT_DOMAIN),
+                $event,
                 $status
             ));
         }
 
+        $order->save();
         wp_send_json(array('received' => true, 'updated' => true));
+    }
+
+    /**
+     * Resolve the WooCommerce order targeted by a webhook from the signed
+     * body alone. Tries:
+     *  1. Stored _acountpay_payment_id meta lookup.
+     *  2. Stored _acountpay_reference_number meta lookup.
+     *  3. Order number lookup (covers stores not yet using the new meta).
+     */
+    protected function resolve_order_from_webhook($reference_number, $payment_id)
+    {
+        if ($payment_id !== '') {
+            $orders = wc_get_orders(array(
+                'limit'      => 1,
+                'meta_key'   => '_acountpay_payment_id',
+                'meta_value' => $payment_id,
+                'return'     => 'ids',
+            ));
+            if (!empty($orders)) {
+                return wc_get_order($orders[0]);
+            }
+        }
+        if ($reference_number !== '') {
+            $orders = wc_get_orders(array(
+                'limit'      => 1,
+                'meta_key'   => '_acountpay_reference_number',
+                'meta_value' => $reference_number,
+                'return'     => 'ids',
+            ));
+            if (!empty($orders)) {
+                return wc_get_order($orders[0]);
+            }
+            // Fall back to the order number (Woo's get_order_number).
+            $maybe = wc_get_order((int) $reference_number);
+            if ($maybe) {
+                return $maybe;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Admin: register the order-edit meta box on both legacy + HPOS screens.
+     */
+    public function register_order_meta_box()
+    {
+        $screens = array('shop_order');
+        if (class_exists('Automattic\\WooCommerce\\Internal\\DataStores\\Orders\\CustomOrdersTableController')) {
+            // HPOS uses the woocommerce_page_wc-orders screen id.
+            $screens[] = function_exists('wc_get_page_screen_id') ? wc_get_page_screen_id('shop-order') : 'woocommerce_page_wc-orders';
+        }
+        foreach ($screens as $screen) {
+            add_meta_box(
+                'acountpay-order-meta',
+                __('Pay by Bank', ACOUNTPAY_TEXT_DOMAIN),
+                array($this, 'render_order_meta_box'),
+                $screen,
+                'side',
+                'default'
+            );
+        }
+    }
+
+    public function render_order_meta_box($post_or_order)
+    {
+        $order = ($post_or_order instanceof WP_Post) ? wc_get_order($post_or_order->ID) : $post_or_order;
+        if (!$order || $order->get_payment_method() !== $this->id) {
+            echo '<p>' . esc_html__('Not a Pay by Bank order.', ACOUNTPAY_TEXT_DOMAIN) . '</p>';
+            return;
+        }
+        $pid       = (string) $order->get_meta('_acountpay_payment_id');
+        $ref       = (string) $order->get_meta('_acountpay_reference_number');
+        $status    = (string) $order->get_meta('_acountpay_status');
+        $refunded  = (string) $order->get_meta('_acountpay_refunded_amount');
+        $last_hook = (int) $order->get_meta('_acountpay_last_webhook_at');
+        $pos_url   = (string) $order->get_meta('_acountpay_pos_url');
+        $nonce     = wp_create_nonce('acountpay_reverify_' . $order->get_id());
+        ?>
+        <p style="margin:0 0 6px;"><strong><?php esc_html_e('Payment ID', ACOUNTPAY_TEXT_DOMAIN); ?>:</strong><br/>
+            <code style="word-break:break-all;"><?php echo esc_html($pid !== '' ? $pid : '—'); ?></code>
+        </p>
+        <p style="margin:0 0 6px;"><strong><?php esc_html_e('Reference', ACOUNTPAY_TEXT_DOMAIN); ?>:</strong> <code><?php echo esc_html($ref !== '' ? $ref : '—'); ?></code></p>
+        <p style="margin:0 0 6px;"><strong><?php esc_html_e('Backend status', ACOUNTPAY_TEXT_DOMAIN); ?>:</strong> <code><?php echo esc_html($status !== '' ? $status : '—'); ?></code></p>
+        <?php if ($refunded !== '' && (float) $refunded > 0) : ?>
+            <p style="margin:0 0 6px;"><strong><?php esc_html_e('Refunded amount', ACOUNTPAY_TEXT_DOMAIN); ?>:</strong> <?php echo esc_html(wc_price((float) $refunded, array('currency' => $order->get_currency()))); ?></p>
+        <?php endif; ?>
+        <p style="margin:0 0 6px;"><strong><?php esc_html_e('Last webhook', ACOUNTPAY_TEXT_DOMAIN); ?>:</strong>
+            <?php echo $last_hook ? esc_html(human_time_diff($last_hook, time()) . ' ' . __('ago', ACOUNTPAY_TEXT_DOMAIN)) : esc_html__('never', ACOUNTPAY_TEXT_DOMAIN); ?>
+        </p>
+        <?php if ($pos_url !== '') : ?>
+            <p style="margin:0 0 6px;"><a href="<?php echo esc_url($pos_url); ?>" target="_blank" rel="noopener"><?php esc_html_e('Open POS link', ACOUNTPAY_TEXT_DOMAIN); ?></a></p>
+        <?php endif; ?>
+        <p style="margin-top:10px;">
+            <button type="button" class="button button-secondary" id="acountpay-reverify-btn"
+                data-order="<?php echo esc_attr((string) $order->get_id()); ?>"
+                data-nonce="<?php echo esc_attr($nonce); ?>"><?php esc_html_e('Re-verify status', ACOUNTPAY_TEXT_DOMAIN); ?></button>
+            <span id="acountpay-reverify-result" style="margin-left:6px;"></span>
+        </p>
+        <p style="margin-top:6px;font-size:11px;color:#666;">
+            <?php esc_html_e('To refund a Pay by Bank order, refund the customer manually from your bank account, then mark the transaction as refunded in your AcountPay Merchant Dashboard. The order here will update automatically.', ACOUNTPAY_TEXT_DOMAIN); ?>
+        </p>
+        <script>
+        (function(){
+            var btn = document.getElementById('acountpay-reverify-btn');
+            if (!btn) return;
+            btn.addEventListener('click', function(){
+                var out = document.getElementById('acountpay-reverify-result');
+                out.textContent = '…';
+                btn.disabled = true;
+                var fd = new FormData();
+                fd.append('action', 'acountpay_reverify_order');
+                fd.append('order_id', btn.dataset.order);
+                fd.append('_wpnonce', btn.dataset.nonce);
+                fetch(ajaxurl, { method: 'POST', credentials: 'same-origin', body: fd })
+                    .then(function(r){ return r.json(); })
+                    .then(function(data){
+                        btn.disabled = false;
+                        if (data && data.success) {
+                            out.textContent = (data.data && data.data.message) ? data.data.message : 'OK';
+                            out.style.color = '#0a7d20';
+                            setTimeout(function(){ location.reload(); }, 1200);
+                        } else {
+                            out.textContent = (data && data.data && data.data.message) ? data.data.message : 'Failed';
+                            out.style.color = '#a40000';
+                        }
+                    })
+                    .catch(function(err){
+                        btn.disabled = false;
+                        out.textContent = err.message;
+                        out.style.color = '#a40000';
+                    });
+            });
+        })();
+        </script>
+        <?php
+    }
+
+    /**
+     * Admin AJAX: re-poll the backend for current payment status and update
+     * the order accordingly (without waiting for another webhook).
+     */
+    public function ajax_reverify_order()
+    {
+        if (!current_user_can('edit_shop_orders')) {
+            wp_send_json_error(array('message' => __('Insufficient permissions', ACOUNTPAY_TEXT_DOMAIN)), 403);
+        }
+        $order_id = isset($_POST['order_id']) ? absint($_POST['order_id']) : 0;
+        check_ajax_referer('acountpay_reverify_' . $order_id);
+        $order = wc_get_order($order_id);
+        if (!$order || $order->get_payment_method() !== $this->id) {
+            wp_send_json_error(array('message' => __('Not a Pay by Bank order.', ACOUNTPAY_TEXT_DOMAIN)), 404);
+        }
+        if (!isset($this->api) || !$this->api) {
+            wp_send_json_error(array('message' => __('API not initialised.', ACOUNTPAY_TEXT_DOMAIN)));
+        }
+        $reference = (string) $order->get_meta('_acountpay_reference_number');
+        if ($reference === '') {
+            $reference = (string) $order->get_order_number();
+        }
+        $result = $this->api->verify_payment_status($reference);
+        if (is_wp_error($result)) {
+            wp_send_json_error(array('message' => $result->get_error_message()));
+        }
+        if (!is_array($result)) {
+            wp_send_json_error(array('message' => __('Unexpected response from AcountPay.', ACOUNTPAY_TEXT_DOMAIN)));
+        }
+        $backend_status = isset($result['status']) ? (string) $result['status'] : '';
+        $order->update_meta_data('_acountpay_status', $backend_status);
+        if (in_array($backend_status, array('paid', 'settled', 'completed', 'processed'), true) && !in_array($order->get_status(), array('processing', 'completed'), true)) {
+            $order->payment_complete((string) $order->get_meta('_acountpay_payment_id'));
+            $this->maybe_apply_paid_status_mapping($order);
+        } elseif (in_array($backend_status, array('refunded', 'partially_refunded'), true) && $order->get_status() !== 'refunded') {
+            $order->update_status('refunded', __('Pay by Bank: backend reports refunded (manual re-verify).', ACOUNTPAY_TEXT_DOMAIN));
+        } elseif (in_array($backend_status, array('failed', 'rejected', 'failure_expired'), true) && !in_array($order->get_status(), array('processing', 'completed'), true)) {
+            $this->apply_failed_status($order, $backend_status);
+        }
+        $order->save();
+        wp_send_json_success(array('message' => sprintf(__('Status: %s', ACOUNTPAY_TEXT_DOMAIN), $backend_status ?: 'unknown')));
+    }
+
+    /**
+     * Order list column.
+     */
+    public function register_order_list_column($columns)
+    {
+        $new = array();
+        foreach ($columns as $key => $value) {
+            $new[$key] = $value;
+            if ($key === 'order_status') {
+                $new['acountpay_status'] = __('Pay by Bank', ACOUNTPAY_TEXT_DOMAIN);
+            }
+        }
+        if (!isset($new['acountpay_status'])) {
+            $new['acountpay_status'] = __('Pay by Bank', ACOUNTPAY_TEXT_DOMAIN);
+        }
+        return $new;
+    }
+
+    public function render_order_list_column($column, $post_id)
+    {
+        if ($column !== 'acountpay_status') {
+            return;
+        }
+        $order = wc_get_order($post_id);
+        $this->render_order_list_column_pill($order);
+    }
+
+    public function render_order_list_column_hpos($column, $order)
+    {
+        if ($column !== 'acountpay_status') {
+            return;
+        }
+        $this->render_order_list_column_pill($order);
+    }
+
+    protected function render_order_list_column_pill($order)
+    {
+        if (!$order || $order->get_payment_method() !== $this->id) {
+            echo '—';
+            return;
+        }
+        $status = (string) $order->get_meta('_acountpay_status');
+        $color  = '#666';
+        $bg     = '#eee';
+        if (in_array($status, array('paid', 'settled', 'completed', 'processed'), true)) {
+            $color = '#0a7d20';
+            $bg    = '#d6f4dc';
+        } elseif (in_array($status, array('refunded', 'partially_refunded'), true)) {
+            $color = '#5a3eaa';
+            $bg    = '#e9defa';
+        } elseif (in_array($status, array('failed', 'rejected', 'failure_expired'), true)) {
+            $color = '#a40000';
+            $bg    = '#fde2e2';
+        }
+        printf(
+            '<span style="display:inline-block;padding:2px 8px;border-radius:999px;background:%s;color:%s;font-size:11px;">%s</span>',
+            esc_attr($bg),
+            esc_attr($color),
+            esc_html($status !== '' ? $status : '—')
+        );
     }
 
     /**

@@ -5,8 +5,8 @@
  * Plugin URI:  https://acountpay.com
  * Author:      AcountPay
  * Author URI:  https://acountpay.com
- * Description: Easily integrate and accept secure online payments on your WooCommerce store using the AcountPay Payment Gateway. This plugin enables seamless bank payments and provides a user-friendly checkout experience. Compatible with both classic and block-based WooCommerce checkout, it includes powerful admin tools, webhook handling, and real-time payment status updates.
- * Version:     2.0.0
+ * Description: Pay by Bank for WooCommerce, powered by AcountPay. Lets shoppers pay directly from their bank account via PSD2 / open banking, with a configurable bank-logo carousel, classic + block checkout support, signed callbacks, signed server-to-server webhooks, an order-edit panel showing payment id and PSU lookup state, and a manual-refund flow driven from the AcountPay Merchant Dashboard.
+ * Version:     2.1.0
  * Requires at least: 5.8
  * Tested up to: 6.9.1
  * Requires PHP: 7.4
@@ -23,7 +23,7 @@ if (!defined('ABSPATH')) {
 }
 
 //define the plugin constants
-define('ACOUNTPAY_PAYMENT_VERSION', '2.0.0');
+define('ACOUNTPAY_PAYMENT_VERSION', '2.1.0');
 define('ACOUNTPAY_PAYMENT_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('ACOUNTPAY_PAYMENT_PLUGIN_PATH', plugin_dir_path(__FILE__));
 define('ACOUNTPAY_TEXT_DOMAIN', 'acountpay-payment');
@@ -79,6 +79,14 @@ function acountpay_payment_block_support()
 //initialize the plugin
 function acountpay_payment_init()
 {
+    // Load translations from /languages so visible strings (e.g. "Pay by Bank")
+    // render in the shopper's locale when da_DK / fi .mo files are present.
+    load_plugin_textdomain(
+        'acountpay-payment',
+        false,
+        dirname(plugin_basename(ACOUNTPAY_PAYMENT_FILE)) . '/languages'
+    );
+
     //check if the class exists AcountPay_Payment_Gateway
     if (!class_exists('AcountPay_Payment_Gateway')) {
         // Include API class first

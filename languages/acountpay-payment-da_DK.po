@@ -1,0 +1,72 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: AcountPay Payment Gateway 2.0.0\n"
+"Report-Msgid-Bugs-To: https://acountpay.com\n"
+"POT-Creation-Date: 2026-04-19 00:00+0000\n"
+"PO-Revision-Date: 2026-04-19 00:00+0000\n"
+"Language-Team: Danish <da@acountpay.com>\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: da_DK\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+# Gateway label / branding
+msgid "Pay by Bank"
+msgstr "Betal med bankkonto"
+
+msgid "Let your customers pay directly from their bank account via Pay by Bank (powered by AcountPay)."
+msgstr "Lad dine kunder betale direkte fra deres bankkonto via Betal med bankkonto (drevet af AcountPay)."
+
+msgid "Pay securely and directly from your bank account."
+msgstr "Betal sikkert og direkte fra din bankkonto."
+
+msgid "Enable Pay by Bank"
+msgstr "Aktivér Betal med bankkonto"
+
+# Settings labels
+msgid "Title"
+msgstr "Titel"
+
+msgid "This controls the title which the user sees during checkout."
+msgstr "Styrer den titel, brugeren ser ved kassen."
+
+msgid "Description"
+msgstr "Beskrivelse"
+
+msgid "This controls the description which the user sees during checkout."
+msgstr "Styrer den beskrivelse, brugeren ser ved kassen."
+
+msgid "Bank logos"
+msgstr "Banklogoer"
+
+msgid "Pick which bank logos appear in the auto-scrolling carousel next to the Pay by Bank label on checkout. Defaults to all supported Finnish banks."
+msgstr "Vælg hvilke banklogoer der vises i den rullende karrusel ved siden af etiketten Betal med bankkonto i kassen. Standard er alle understøttede finske banker."
+
+msgid "Show \"How it works\" info bubble"
+msgstr "Vis \"Sådan fungerer det\"-infoboble"
+
+msgid "Show a small (i) info bubble next to the Pay by Bank label that explains the 3 payment steps to shoppers."
+msgstr "Vis en lille (i)-infoboble ved siden af etiketten Betal med bankkonto, som forklarer kunderne de 3 betalingstrin."
+
+msgid "Skip desktop QR page"
+msgstr "Spring desktop-QR-siden over"
+
+msgid "Send desktop shoppers straight to bank selection (skip the scan-with-phone QR step)."
+msgstr "Send desktop-kunder direkte til bankvalg (spring scan-med-telefon-QR-trinnet over)."
+
+msgid "When enabled, desktop shoppers go directly to the bank selector on the AcountPay pay page instead of seeing the QR / continue-on-this-device screen first."
+msgstr "Når den er slået til, går desktop-kunder direkte til bankvælgeren på AcountPays betalingsside i stedet for først at se QR-/fortsæt-på-denne-enhed-skærmen."
+
+# Info bubble
+msgid "How Pay by Bank works"
+msgstr "Sådan fungerer Betal med bankkonto"
+
+msgid "Select your bank"
+msgstr "Vælg din bank"
+
+msgid "Log in to your bank app or netbank"
+msgstr "Log ind i din bankapp eller netbank"
+
+msgid "Authorise the payment"
+msgstr "Godkend betalingen"

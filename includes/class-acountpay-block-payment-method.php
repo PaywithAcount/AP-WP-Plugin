@@ -36,8 +36,13 @@ final class WC_AcountPay_Payment_Gateway_Block_Support extends AbstractPaymentMe
      */
     public function is_active()
     {
-        $payment_gateways_class = WC()->payment_gateways();
-        $payment_gateways       = $payment_gateways_class->payment_gateways();
+        if (!function_exists('WC') || !WC()->payment_gateways()) {
+            return false;
+        }
+        $payment_gateways = WC()->payment_gateways()->payment_gateways();
+        if (empty($payment_gateways['acountpay_payment'])) {
+            return false;
+        }
         return $payment_gateways['acountpay_payment']->is_available();
     }
 
@@ -68,16 +73,32 @@ final class WC_AcountPay_Payment_Gateway_Block_Support extends AbstractPaymentMe
      */
     public function get_payment_method_data()
     {
-        $payment_gateways_class = WC()->payment_gateways();
-        $payment_gateways       = $payment_gateways_class->payment_gateways();
-        $gateway                = $payment_gateways['acountpay_payment'];
+        $payment_gateways = WC()->payment_gateways() ? WC()->payment_gateways()->payment_gateways() : array();
+        $gateway          = isset($payment_gateways['acountpay_payment']) ? $payment_gateways['acountpay_payment'] : null;
+        if (!$gateway) {
+            return array(
+                'title'             => $this->get_setting('title', 'Pay by Bank'),
+                'description'       => $this->get_setting('description', ''),
+                'supports'          => array(),
+                'allow_saved_cards' => false,
+                'bank_logos'        => array(),
+                'info_bubble'       => array('enabled' => false),
+            );
+        }
+
+        $info_enabled = 'yes' === $gateway->get_option('show_info_bubble', 'yes');
 
         return array(
             'title'             => $this->get_setting('title'),
             'description'       => $this->get_setting('description'),
             'supports'          => array_filter($gateway->supports, array($gateway, 'supports')),
             'allow_saved_cards' => $gateway->saved_cards,
-            'logo_urls'         => array($payment_gateways['acountpay_payment']->get_logo_url()),
+            'bank_logos'        => $gateway->get_bank_logo_urls(),
+            'info_bubble'       => array(
+                'enabled' => $info_enabled,
+                'heading' => $gateway->get_info_heading(),
+                'steps'   => $gateway->get_info_steps(),
+            ),
         );
     }
 
@@ -106,13 +127,8 @@ final class WC_AcountPay_Payment_Gateway_Block_Support extends AbstractPaymentMe
             true
         );
 
-        //logo url
-        $logo_url = WC_HTTPS::force_https_url(ACOUNTPAY_PAYMENT_PLUGIN_URL . '/assets/images/logo.jpg');
-
-        //localize script
-        wp_localize_script('wc-acountpay-payment-blocks-integration', 'acountpay_payment_data', array(
-            'logo_url' => $logo_url
-        ));
+        // Settings (title, description, bank_logos, info_bubble) are exposed to the
+        // block via getSetting('acountpay_payment_data') from get_payment_method_data().
 
         return array('wc-acountpay-payment-blocks-integration');
     }

@@ -62,7 +62,7 @@ class AcountPay_API
      * @param array $data Request data
      * @return array|WP_Error Response data or WP_Error on failure
      */
-    private function make_request($endpoint, $method = 'GET', $data = array())
+    private function make_request($endpoint, $method = 'GET', $data = array(), $extra_headers = array())
     {
         $url = $this->api_base_url . $endpoint;
         
@@ -81,6 +81,14 @@ class AcountPay_API
         $headers = array(
             'Content-Type' => 'application/json',
         );
+        if (is_array($extra_headers)) {
+            foreach ($extra_headers as $h_name => $h_value) {
+                if ($h_value === null || $h_value === '') {
+                    continue;
+                }
+                $headers[$h_name] = (string) $h_value;
+            }
+        }
 
         $args = array(
             'method' => $method,
@@ -349,7 +357,11 @@ class AcountPay_API
     /**
      * Create v2 payment link (extension flow – bank selected on AcountPay POS).
      * Requires: clientId, amount, referenceNumber, redirectUrl.
-     * Optional: description, currency, webhookUrl.
+     * Optional: description, currency, webhookUrl, idempotencyKey.
+     *
+     * The idempotencyKey is sent as an `Idempotency-Key` header — if the backend
+     * supports it, repeated calls with the same key (e.g. two "Place Order"
+     * clicks) return the same payment link instead of creating a duplicate.
      *
      * @param array $data Payment link parameters
      * @return array|WP_Error Response with redirectUrl (POS pay page) or WP_Error on failure
@@ -381,9 +393,12 @@ class AcountPay_API
             $body['webhookUrl'] = $data['webhookUrl'];
         }
 
-        $response = $this->make_request($endpoint, 'POST', $body);
+        $headers = array();
+        if (!empty($data['idempotencyKey'])) {
+            $headers['Idempotency-Key'] = (string) $data['idempotencyKey'];
+        }
 
-        return $response;
+        return $this->make_request($endpoint, 'POST', $body, $headers);
     }
 
     /**
