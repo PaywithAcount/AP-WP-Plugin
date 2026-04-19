@@ -418,6 +418,89 @@ class AcountPay_API
     }
 
     /**
+     * Fetch the slim, public bank-logo list for a country and cache it as a
+     * WordPress transient. Falls back to the cached copy on transient errors.
+     *
+     * Format returned:
+     *   array(
+     *     array('bankId' => 'ngp-okoy', 'name' => 'OP Pohjola', 'logoUrl' => 'https://…png'),
+     *     ...
+     *   )
+     *
+     * @param string $country_code ISO 3166-1 alpha-2 (e.g. "FI", "DK").
+     * @param bool   $force_refresh When true, bypasses the cache.
+     * @return array<int,array<string,string>>|WP_Error
+     */
+    public function get_country_banks($country_code = 'FI', $force_refresh = false)
+    {
+        $country_code = strtoupper(substr((string) $country_code, 0, 2));
+        if ($country_code === '') {
+            return new WP_Error('invalid_country', 'Country code is required');
+        }
+
+        $cache_key = 'acountpay_banks_' . strtolower($country_code);
+
+        if (!$force_refresh) {
+            $cached = get_transient($cache_key);
+            if (is_array($cached)) {
+                return $cached;
+            }
+        }
+
+        $endpoint = '/banks/public/logos?country=' . rawurlencode($country_code);
+        $response = $this->make_request($endpoint, 'GET');
+
+        if (is_wp_error($response)) {
+            // On error, return the stale cache if any so the carousel doesn't
+            // suddenly disappear when the API hiccups.
+            $stale = get_transient($cache_key . '_stale');
+            if (is_array($stale)) {
+                return $stale;
+            }
+            return $response;
+        }
+
+        if (!is_array($response) || empty($response['banks']) || !is_array($response['banks'])) {
+            $stale = get_transient($cache_key . '_stale');
+            if (is_array($stale)) {
+                return $stale;
+            }
+            return new WP_Error('invalid_response', 'Bank list response was empty or malformed');
+        }
+
+        $clean = array();
+        foreach ($response['banks'] as $b) {
+            if (empty($b['bankId']) || empty($b['logoUrl'])) {
+                continue;
+            }
+            $logo_url = (string) $b['logoUrl'];
+            if (!preg_match('#^https?://#i', $logo_url)) {
+                continue;
+            }
+            $clean[] = array(
+                'bankId'  => sanitize_text_field((string) $b['bankId']),
+                'name'    => sanitize_text_field((string) ($b['name'] ?? $b['bankId'])),
+                'logoUrl' => esc_url_raw($logo_url),
+            );
+        }
+
+        if (empty($clean)) {
+            $stale = get_transient($cache_key . '_stale');
+            if (is_array($stale)) {
+                return $stale;
+            }
+            return new WP_Error('empty_result', 'No banks with logos returned');
+        }
+
+        // Fresh cache: 24h. Long-lived stale cache: 7d (used as fallback when
+        // the API fails so checkout never renders an empty/text-only carousel).
+        set_transient($cache_key, $clean, DAY_IN_SECONDS);
+        set_transient($cache_key . '_stale', $clean, 7 * DAY_IN_SECONDS);
+
+        return $clean;
+    }
+
+    /**
      * Get API base URL
      * 
      * @return string

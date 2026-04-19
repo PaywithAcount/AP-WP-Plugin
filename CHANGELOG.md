@@ -7,6 +7,36 @@ The plugin follows [Semantic Versioning](https://semver.org/) once it leaves
 2.x. Until then, the major number tracks the AcountPay payment-link API
 generation (v2 → 2.x).
 
+## 2.1.1 — 2026-04-19
+
+### Added
+
+- **Live bank logos.** The bank-logo carousel on the checkout button and the
+  bank-logos multiselect in settings are now driven by the new public
+  `GET /banks/public/logos?country=FI` endpoint on AcountPay, so merchants
+  always see the latest, on-brand CDN logos (`d5cm9vkx3vulc.cloudfront.net/…`)
+  without shipping a plugin update. Results are cached as a WordPress
+  transient for 24 h with a 7-day stale fallback so checkout never breaks if
+  the API is briefly unreachable.
+- **Country setting.** New "Bank country" select in the gateway settings
+  (currently FI / DK) drives which country's banks the carousel and the
+  multiselect populate from. Saving a new country clears the cached list.
+- **Refresh bank list button.** New admin AJAX endpoint
+  (`acountpay_refresh_banks`) backed by a button in settings that drops the
+  transient and re-pulls the bank list immediately — useful right after a
+  new bank is enabled in AcountPay.
+- **Bundled SVG fallback.** The shipped `assets/images/banks/*.svg` files are
+  now treated as offline fallbacks and only used when the live API doesn't
+  return a logo URL for that bankId.
+
+### Changed
+
+- `get_supported_banks()` and `get_bank_logo_urls()` now key on AcountPay
+  / Token.io `bankId` (`ngp-okoy`, `ngp-ndeafi`, `ob-aktia`, …). Settings
+  saved with the previous human-readable slugs (`op`, `nordea`, …) are
+  migrated on the fly via an alias map in `get_bundled_banks_fallback()`,
+  so no merchant action is required.
+
 ## 2.1.0 — 2026-04-19
 
 This is a security + payment-tracking + refund-workflow release. Existing

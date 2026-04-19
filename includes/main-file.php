@@ -158,6 +158,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
 
         // AJAX endpoints — admin-only "Test connection" and "Re-verify status".
         add_action('wp_ajax_acountpay_test_connection', [$this, 'ajax_test_connection']);
+        add_action('wp_ajax_acountpay_refresh_banks', [$this, 'ajax_refresh_banks']);
         add_action('wp_ajax_acountpay_reverify_order', [$this, 'ajax_reverify_order']);
 
         //is valid for use
@@ -181,52 +182,171 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
     }
 
     /**
-     * Curated list of bank logos shipped with the plugin, keyed by slug.
-     * Slug must match the SVG filename under assets/images/banks/.
+     * Bundled fallback bank list shipped with the plugin. Used when the
+     * AcountPay /banks/public/logos endpoint is unreachable so the carousel
+     * never falls back to "text only".
+     *
+     * Each entry maps a Token.io / AcountPay bankId → display name + bundled
+     * SVG filename under assets/images/banks/. The legacy slug aliases let
+     * settings saved in plugin v2.0–v2.1 keep resolving cleanly after we
+     * switched the option keys from human slugs to bankIds.
+     *
+     * @return array<string, array{name:string, svg:string, aliases:array<int,string>}>
      */
-    public function get_supported_banks()
+    public function get_bundled_banks_fallback()
     {
         return array(
-            'op'               => 'OP',
-            'nordea'           => 'Nordea',
-            'danske-bank'      => 'Danske Bank',
-            's-pankki'         => 'S-Pankki',
-            'aktia'            => 'Aktia',
-            'handelsbanken'    => 'Handelsbanken',
-            'saastopankki'     => 'Säästöpankki',
-            'pop-pankki'       => 'POP Pankki',
-            'alandsbanken'     => 'Ålandsbanken',
-            'oma-saastopankki' => 'Oma Säästöpankki',
+            'ngp-okoy'        => array('name' => 'OP Pohjola',                'svg' => 'op.svg',               'aliases' => array('op')),
+            'ngp-ndeafi'      => array('name' => 'Nordea Bank',               'svg' => 'nordea.svg',           'aliases' => array('nordea')),
+            'ob-danske-fin'   => array('name' => 'Danske Bank',               'svg' => 'danske-bank.svg',      'aliases' => array('danske-bank')),
+            'ob-spanfi'       => array('name' => 'S-Pankki',                  'svg' => 's-pankki.svg',         'aliases' => array('s-pankki')),
+            'ob-aktia'        => array('name' => 'Aktia',                     'svg' => 'aktia.svg',            'aliases' => array('aktia')),
+            'ngp-saot'        => array('name' => 'Säästöpankki',              'svg' => 'saastopankki.svg',     'aliases' => array('saastopankki')),
+            'ngp-popf'        => array('name' => 'POP Pankki',                'svg' => 'pop-pankki.svg',       'aliases' => array('pop-pankki')),
+            'ob-alanfi'       => array('name' => 'Ålandsbanken',              'svg' => 'alandsbanken.svg',     'aliases' => array('alandsbanken')),
+            'ngp-omsa'        => array('name' => 'Oma Säästöpankki',          'svg' => 'oma-saastopankki.svg', 'aliases' => array('oma-saastopankki')),
         );
+    }
+
+    /**
+     * Build the full options map (bankId => display name) for the merchant's
+     * configured country. Live AcountPay data is preferred — bundled fallback
+     * fills the gaps so the settings screen and carousel keep working offline.
+     *
+     * @param string $country_code ISO-3166-1 alpha-2 (defaults to merchant setting → "FI").
+     * @return array<string,string>
+     */
+    public function get_supported_banks($country_code = null)
+    {
+        $country_code = strtoupper((string) ($country_code ?: $this->get_option('bank_country', 'FI')));
+        $bundled      = $this->get_bundled_banks_fallback();
+
+        $live = array();
+        if (class_exists('AcountPay_API')) {
+            $api    = new AcountPay_API();
+            $result = $api->get_country_banks($country_code);
+            if (is_array($result)) {
+                foreach ($result as $row) {
+                    if (empty($row['bankId'])) {
+                        continue;
+                    }
+                    $live[$row['bankId']] = !empty($row['name']) ? $row['name'] : $row['bankId'];
+                }
+            }
+        }
+
+        // Live first (preserves API ordering), then any bundled rows the API
+        // didn't return — only if we actually got live data; otherwise fall
+        // back to the full bundled list so the settings UI is never empty.
+        if (!empty($live)) {
+            $supported = $live;
+            foreach ($bundled as $bankId => $meta) {
+                if (!isset($supported[$bankId])) {
+                    $supported[$bankId] = $meta['name'];
+                }
+            }
+        } else {
+            $supported = array();
+            foreach ($bundled as $bankId => $meta) {
+                $supported[$bankId] = $meta['name'];
+            }
+        }
+
+        return apply_filters('woocommerce_acountpay_supported_banks', $supported, $country_code, $this->id);
+    }
+
+    /**
+     * Translate a stored option value (which may be a legacy slug from the
+     * pre-2.1 settings or an empty array) into a list of canonical bankIds.
+     *
+     * @param mixed $stored
+     * @return string[]
+     */
+    private function normalize_selected_bank_ids($stored)
+    {
+        if (!is_array($stored)) {
+            return array();
+        }
+        $bundled    = $this->get_bundled_banks_fallback();
+        $alias_map  = array();
+        foreach ($bundled as $bankId => $meta) {
+            foreach ($meta['aliases'] as $alias) {
+                $alias_map[$alias] = $bankId;
+            }
+        }
+
+        $out = array();
+        foreach ($stored as $val) {
+            $val = (string) $val;
+            if ($val === '') {
+                continue;
+            }
+            if (isset($alias_map[$val])) {
+                $out[] = $alias_map[$val];
+            } else {
+                $out[] = $val;
+            }
+        }
+        return array_values(array_unique($out));
     }
 
     /**
      * Resolve the merchant-selected bank logos to renderable items.
      *
+     * Live AcountPay logo URLs are preferred. If the live URL is missing for
+     * a selected bank we fall back to the bundled SVG (when one ships for
+     * that bankId). Banks with neither a live nor a bundled logo are skipped.
+     *
      * @return array<int, array{slug:string,name:string,url:string}>
      */
     public function get_bank_logo_urls()
     {
-        $supported = $this->get_supported_banks();
-        $selected  = $this->get_option('bank_logos', array_keys($supported));
-        if (!is_array($selected)) {
+        $country_code = strtoupper((string) $this->get_option('bank_country', 'FI'));
+        $supported    = $this->get_supported_banks($country_code);
+        $bundled      = $this->get_bundled_banks_fallback();
+
+        $stored   = $this->get_option('bank_logos', array_keys($supported));
+        $selected = $this->normalize_selected_bank_ids($stored);
+        if (empty($selected)) {
             $selected = array_keys($supported);
         }
 
+        // Build a lookup of live logoUrls keyed by bankId.
+        $live_urls = array();
+        if (class_exists('AcountPay_API')) {
+            $api    = new AcountPay_API();
+            $result = $api->get_country_banks($country_code);
+            if (is_array($result)) {
+                foreach ($result as $row) {
+                    if (!empty($row['bankId']) && !empty($row['logoUrl'])) {
+                        $live_urls[$row['bankId']] = $row['logoUrl'];
+                    }
+                }
+            }
+        }
+
         $urls = array();
-        foreach ($selected as $slug) {
-            if (!isset($supported[$slug])) {
+        foreach ($selected as $bankId) {
+            $name = isset($supported[$bankId]) ? $supported[$bankId] : (isset($bundled[$bankId]) ? $bundled[$bankId]['name'] : $bankId);
+
+            $url = '';
+            if (!empty($live_urls[$bankId])) {
+                $url = $live_urls[$bankId];
+            } elseif (isset($bundled[$bankId])) {
+                $relative = 'assets/images/banks/' . $bundled[$bankId]['svg'];
+                $absolute = ACOUNTPAY_PAYMENT_PLUGIN_PATH . $relative;
+                if (file_exists($absolute)) {
+                    $url = WC_HTTPS::force_https_url(ACOUNTPAY_PAYMENT_PLUGIN_URL . $relative);
+                }
+            }
+            if ($url === '') {
                 continue;
             }
-            $relative = 'assets/images/banks/' . $slug . '.svg';
-            $absolute = ACOUNTPAY_PAYMENT_PLUGIN_PATH . $relative;
-            if (!file_exists($absolute)) {
-                continue;
-            }
+
             $urls[] = array(
-                'slug' => $slug,
-                'name' => $supported[$slug],
-                'url'  => WC_HTTPS::force_https_url(ACOUNTPAY_PAYMENT_PLUGIN_URL . $relative),
+                'slug' => $bankId,
+                'name' => $name,
+                'url'  => $url,
             );
         }
 
@@ -400,7 +520,8 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
      */
     public function init_form_fields()
     {
-        $supported_banks = $this->get_supported_banks();
+        $bank_country    = strtoupper((string) $this->get_option('bank_country', 'FI'));
+        $supported_banks = $this->get_supported_banks($bank_country);
 
         $form_fields = apply_filters('woo_acountpay_payment', [
             'enabled' => [
@@ -423,15 +544,29 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                 'default' => __('Pay securely and directly from your bank account.', ACOUNTPAY_TEXT_DOMAIN),
                 'desc_tip' => true
             ],
+            'bank_country' => [
+                'title'       => __('Bank country', ACOUNTPAY_TEXT_DOMAIN),
+                'type'        => 'select',
+                'description' => __('Country whose banks AcountPay should offer. Picks the live bank list (and CDN logos) used by the carousel below.', ACOUNTPAY_TEXT_DOMAIN),
+                'default'     => 'FI',
+                'desc_tip'    => true,
+                'options'     => array(
+                    'FI' => __('Finland', ACOUNTPAY_TEXT_DOMAIN),
+                    'DK' => __('Denmark', ACOUNTPAY_TEXT_DOMAIN),
+                ),
+            ],
             'bank_logos' => [
                 'title' => __('Bank logos', ACOUNTPAY_TEXT_DOMAIN),
                 'type' => 'multiselect',
                 'class' => 'wc-enhanced-select',
                 'css' => 'min-width: 350px;',
-                'description' => __('Pick which bank logos appear in the auto-scrolling carousel next to the Pay by Bank label on checkout. Defaults to all supported Finnish banks.', ACOUNTPAY_TEXT_DOMAIN),
+                'description' => __('Pick which bank logos appear in the auto-scrolling carousel next to the Pay by Bank label on checkout. Live logos are pulled from AcountPay; bundled SVGs are used as a fallback. Save the country first if you just changed it, then pick logos.', ACOUNTPAY_TEXT_DOMAIN),
                 'options' => $supported_banks,
                 'default' => array_keys($supported_banks),
                 'desc_tip' => true,
+            ],
+            'bank_logos_refresh' => [
+                'type' => 'bank_logos_refresh',
             ],
             'show_info_bubble' => [
                 'title' => __('Show "How it works" info bubble', ACOUNTPAY_TEXT_DOMAIN),
@@ -671,7 +806,111 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
     }
 
     /**
+     * "Refresh bank list" button next to the bank-logos multiselect. Clears
+     * the cached bank list so the next page load (or this one, after the
+     * AJAX completes and the page reloads) pulls fresh data + logos from
+     * AcountPay.
+     */
+    public function generate_bank_logos_refresh_html($key, $data)
+    {
+        $field_key = $this->get_field_key($key);
+        $nonce     = wp_create_nonce('acountpay_refresh_banks');
+        ob_start();
+        ?>
+        <tr valign="top">
+            <th scope="row" class="titledesc">
+                <label><?php esc_html_e('Refresh bank list', ACOUNTPAY_TEXT_DOMAIN); ?></label>
+            </th>
+            <td class="forminp">
+                <button type="button" class="button button-secondary" id="acountpay-refresh-banks-btn"
+                    data-nonce="<?php echo esc_attr($nonce); ?>"
+                    data-pending="<?php echo esc_attr__('Refreshing…', ACOUNTPAY_TEXT_DOMAIN); ?>"
+                    data-default="<?php echo esc_attr__('Refresh bank list', ACOUNTPAY_TEXT_DOMAIN); ?>"
+                ><?php esc_html_e('Refresh bank list', ACOUNTPAY_TEXT_DOMAIN); ?></button>
+                <span id="acountpay-refresh-banks-result" style="margin-left:10px;"></span>
+                <p class="description"><?php esc_html_e('Fetches the latest bank list and CDN logos from AcountPay for the country selected above. Cached for 24 hours; click here to force an immediate refresh.', ACOUNTPAY_TEXT_DOMAIN); ?></p>
+                <script>
+                (function(){
+                    var btn = document.getElementById('acountpay-refresh-banks-btn');
+                    if (!btn) return;
+                    btn.addEventListener('click', function(){
+                        var out = document.getElementById('acountpay-refresh-banks-result');
+                        out.textContent = '';
+                        btn.disabled = true;
+                        btn.textContent = btn.dataset.pending;
+                        var fd = new FormData();
+                        fd.append('action', 'acountpay_refresh_banks');
+                        fd.append('_wpnonce', btn.dataset.nonce);
+                        var countryEl = document.getElementById('woocommerce_acountpay_payment_bank_country');
+                        if (countryEl) { fd.append('country', countryEl.value || 'FI'); }
+                        fetch(ajaxurl, { method: 'POST', credentials: 'same-origin', body: fd })
+                            .then(function(r){ return r.json(); })
+                            .then(function(data){
+                                btn.disabled = false;
+                                btn.textContent = btn.dataset.default;
+                                if (data && data.success) {
+                                    out.innerHTML = '<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:#d6f4dc;color:#0a7d20;font-weight:600;">' + (data.data && data.data.message ? data.data.message : 'OK') + '</span>';
+                                    setTimeout(function(){ window.location.reload(); }, 800);
+                                } else {
+                                    var msg = (data && data.data && data.data.message) ? data.data.message : 'Request failed';
+                                    out.innerHTML = '<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:#fde2e2;color:#a40000;font-weight:600;">' + msg + '</span>';
+                                }
+                            })
+                            .catch(function(err){
+                                btn.disabled = false;
+                                btn.textContent = btn.dataset.default;
+                                out.innerHTML = '<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:#fde2e2;color:#a40000;font-weight:600;">' + err.message + '</span>';
+                            });
+                    });
+                })();
+                </script>
+            </td>
+        </tr>
+        <?php
+        return ob_get_clean();
+    }
+
+    /**
+     * Admin AJAX: drop the cached bank/logo list for the current country and
+     * re-pull from AcountPay so the merchant sees changes immediately.
+     */
+    public function ajax_refresh_banks()
+    {
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(array('message' => __('Insufficient permissions', ACOUNTPAY_TEXT_DOMAIN)), 403);
+        }
+        check_ajax_referer('acountpay_refresh_banks');
+
+        $country = isset($_POST['country']) ? strtoupper(substr(sanitize_text_field(wp_unslash($_POST['country'])), 0, 2)) : '';
+        if ($country === '') {
+            $country = strtoupper((string) $this->get_option('bank_country', 'FI'));
+        }
+
+        $cache_key = 'acountpay_banks_' . strtolower($country);
+        delete_transient($cache_key);
+
+        if (!isset($this->api) || !$this->api) {
+            wp_send_json_error(array('message' => __('API not initialised', ACOUNTPAY_TEXT_DOMAIN)));
+        }
+
+        $result = $this->api->get_country_banks($country, true);
+        if (is_wp_error($result)) {
+            wp_send_json_error(array('message' => $result->get_error_message()));
+        }
+        wp_send_json_success(array(
+            'message' => sprintf(
+                /* translators: %1$d count of banks, %2$s country code */
+                __('%1$d banks loaded for %2$s', ACOUNTPAY_TEXT_DOMAIN),
+                count($result),
+                $country
+            ),
+        ));
+    }
+
+    /**
      * Persist settings; keep webhook signing secret when the password field is left blank on save.
+     * Also drops the bank-list cache when the country changes so the multiselect
+     * repopulates from the new country on next render.
      */
     public function process_admin_options()
     {
@@ -680,7 +919,14 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         if ($posted_empty) {
             unset($_POST[$post_key]);
         }
+
+        $previous_country = strtoupper((string) $this->get_option('bank_country', 'FI'));
         parent::process_admin_options();
+        $new_country = strtoupper((string) $this->get_option('bank_country', 'FI'));
+        if ($previous_country !== $new_country) {
+            delete_transient('acountpay_banks_' . strtolower($previous_country));
+            delete_transient('acountpay_banks_' . strtolower($new_country));
+        }
     }
 
     /**
