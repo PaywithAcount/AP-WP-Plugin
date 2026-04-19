@@ -6,7 +6,7 @@
  * Author:      AcountPay
  * Author URI:  https://acountpay.com
  * Description: Pay by Bank for WooCommerce, powered by AcountPay. Lets shoppers pay directly from their bank account via PSD2 / open banking, with a configurable bank-logo carousel, classic + block checkout support, signed callbacks, signed server-to-server webhooks, an order-edit panel showing payment id and PSU lookup state, and a manual-refund flow driven from the AcountPay Merchant Dashboard.
- * Version:     2.1.1
+ * Version:     2.1.4
  * Requires at least: 5.8
  * Tested up to: 6.9.1
  * Requires PHP: 7.4
@@ -23,7 +23,7 @@ if (!defined('ABSPATH')) {
 }
 
 //define the plugin constants
-define('ACOUNTPAY_PAYMENT_VERSION', '2.1.1');
+define('ACOUNTPAY_PAYMENT_VERSION', '2.1.4');
 define('ACOUNTPAY_PAYMENT_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('ACOUNTPAY_PAYMENT_PLUGIN_PATH', plugin_dir_path(__FILE__));
 define('ACOUNTPAY_TEXT_DOMAIN', 'acountpay-payment');
@@ -46,6 +46,10 @@ if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get
     );
     //add action plugins loaded
     add_action('plugins_loaded', 'acountpay_payment_init');
+    //bust the cached bank list whenever the plugin version bumps so merchants
+    //who upgrade past a release with a broken /banks endpoint don't have to
+    //wait up to 7 days for the stale-cache fallback to expire on its own.
+    add_action('plugins_loaded', 'acountpay_payment_maybe_flush_bank_cache', 11);
     //add settings url
     add_filter('plugin_action_links_' . plugin_basename(__FILE__), 'acountpay_payment_settings_link');
     //register woocommerce payment gateway
@@ -94,6 +98,25 @@ function acountpay_payment_init()
         // Then include main gateway class
         include_once ACOUNTPAY_PAYMENT_PLUGIN_PATH . '/includes/main-file.php';
     }
+}
+
+/**
+ * Flush the cached bank list (24h fresh + 7d stale transients) whenever the
+ * plugin version stored in wp_options doesn't match the version constant.
+ * This makes upgrades self-healing — merchants don't need to manually click
+ * "Refresh bank list" after pulling a build that fixed the API path.
+ */
+function acountpay_payment_maybe_flush_bank_cache()
+{
+    $stored = get_option('acountpay_payment_version');
+    if ($stored === ACOUNTPAY_PAYMENT_VERSION) {
+        return;
+    }
+    foreach (array('fi', 'dk', 'se', 'no', 'ee', 'lt', 'lv') as $cc) {
+        delete_transient('acountpay_banks_' . $cc);
+        delete_transient('acountpay_banks_' . $cc . '_stale');
+    }
+    update_option('acountpay_payment_version', ACOUNTPAY_PAYMENT_VERSION, false);
 }
 
 //acountpay_payment_woocommerce_notice

@@ -447,7 +447,10 @@ class AcountPay_API
             }
         }
 
-        $endpoint = '/banks/public/logos?country=' . rawurlencode($country_code);
+        // Note: AcountBackend uses Nest URI versioning (defaultVersion: '1'), so all
+        // routes are prefixed with /v1/. The slim public bank-logo endpoint is
+        // /v1/banks/public/logos and is throttled (60 req/min) but not auth'd.
+        $endpoint = '/v1/banks/public/logos?country=' . rawurlencode($country_code);
         $response = $this->make_request($endpoint, 'GET');
 
         if (is_wp_error($response)) {
@@ -517,18 +520,22 @@ class AcountPay_API
      */
     public function verify_connection()
     {
-        // Try a simple GET request to verify connection
-        $test_endpoint = '/v1/sdk/v1/banks';
+        // Hit the slim public bank-logo endpoint — it requires no auth, returns
+        // a small JSON payload, and proves the AcountBackend is reachable AND
+        // returning a healthy 2xx for a route the plugin actually depends on.
+        // The previously-used /v1/sdk/v1/banks does not exist and always 404'd.
+        $test_endpoint = '/v1/banks/public/logos?country=FI';
         $test_url = $this->api_base_url . $test_endpoint;
         
         $headers = array(
             'Content-Type' => 'application/json',
+            'Accept'       => 'application/json',
         );
 
         $args = array(
             'method' => 'GET',
             'headers' => $headers,
-            'timeout' => 5, // Short timeout for connection check
+            'timeout' => 8,
             'sslverify' => $this->sslverify_enabled, // SSL verification enabled by default for security
         );
 

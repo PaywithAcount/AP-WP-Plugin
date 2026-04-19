@@ -7,6 +7,82 @@ The plugin follows [Semantic Versioning](https://semver.org/) once it leaves
 2.x. Until then, the major number tracks the AcountPay payment-link API
 generation (v2 → 2.x).
 
+## 2.1.4 — 2026-04-19
+
+### Added
+
+- **Configurable payment reference (PSU bank-statement text).** Two new
+  settings under *WooCommerce → Settings → Payments → Pay by Bank*:
+  - **Payment reference (shown on customer's bank statement)** — a free-text
+    template merged with placeholders `{order_number}`, `{order_id}`,
+    `{site_title}`, `{first_name}`, `{last_name}`. Default
+    `{site_title} #{order_number}` (e.g. `Acme Shop #1234`). This text is
+    sent as `referenceNumber` on `POST /v1/sdk/v2/payment-link`, forwarded
+    to Token.io as `displayReference`, and ends up as
+    `remittanceInformationPrimary` — i.e. **the line the customer reads on
+    their bank statement** next to the transaction. Previously the plugin
+    only sent the bare Woo order number, so customers saw a meaningless
+    integer and couldn't recognise the charge.
+  - **Payment reference max length** — number input (6–35, default 18).
+    The plugin pre-truncates the rendered template to this many characters
+    before sending it upstream, so a long template doesn't get silently cut
+    by the bank into something nonsensical. Recommended caps:
+    18 (works on every supported FI/DK bank), 25 (Danske Bank ceiling),
+    35 (Aktia / OP Pohjola / S-Pankki / Ålandsbanken / Wise).
+- The rendered reference is sanitized to the conservative ASCII subset
+  `[A-Za-z0-9 #\-_/.]` before being sent so it survives every bank's
+  per-rail charset filter without surprise truncation. The backend's
+  `payment-rails.config.ts` still enforces per-bank limits as a second line
+  of defence.
+- New filter `woocommerce_acountpay_payment_reference($rendered, $order, $gateway_id)`
+  for sites that need to override the rendered text in code.
+- Reference is persisted to `_acountpay_reference_number` order meta on
+  first render so retries from *My Account → Pay* use the *same* statement
+  text as the original attempt, keeping reconciliation stable.
+
+## 2.1.3 — 2026-04-19
+
+### Fixed
+
+- **Bank-logo carousel now uses the merchant's configured `api_base_url`.**
+  `get_supported_banks()` and `get_bank_logo_urls()` previously instantiated
+  `AcountPay_API()` with no constructor arguments, which silently pinned every
+  public-bank lookup to the hardcoded production URL. Merchants on sandbox /
+  staging / ngrok hosts therefore got no live data and the carousel fell back
+  to the bundled placeholder SVGs (which look like text). The two methods now
+  reuse the gateway's already-configured `$this->api` instance via a new
+  `get_api_for_banks()` helper.
+- **Auto-flush the bank-list transient on plugin upgrade.** Existing installs
+  that picked up a build with the un-versioned `/banks/public/logos` path
+  cached an empty result for up to 7 days and could not refresh the carousel
+  without manually clicking *Refresh bank list*. The plugin now compares the
+  stored version against the live constant on `plugins_loaded` and flushes
+  every cached country list (FI, DK, SE, NO, EE, LT, LV) whenever they
+  differ — so simply pulling 2.1.3 self-heals stale caches.
+- **Cache busts when `api_base_url` changes** in settings, not only when the
+  country changes. Previously a merchant flipping from prod → sandbox would
+  keep seeing the old environment's logos until the 24h fresh cache expired.
+
+## 2.1.2 — 2026-04-19
+
+### Fixed
+
+- **Test connection** button now hits the public, no-auth
+  `/v1/banks/public/logos?country=FI` endpoint instead of the legacy
+  `/v1/sdk/v1/banks` (which never existed and always returned 404 — every
+  click previously surfaced a red "Request failed" pill).
+- **Refresh bank list** button + checkout carousel auto-load now hit
+  `/v1/banks/public/logos` instead of `/banks/public/logos`. AcountBackend
+  uses Nest URI versioning (`defaultVersion: '1'`) so every controller
+  route is served under `/v1/`. Without the prefix the request fell
+  through to a generic 404 and the merchant got an empty bank list.
+- **Webhook URL hint text** in settings no longer instructs merchants to
+  paste the URL into a "Developer → Webhook URL" field on the AcountPay
+  dashboard. There is no such field — AcountPay reads the webhook URL
+  from each `POST /v1/sdk/v2/payment-link` request the plugin makes, so
+  the field in plugin settings is purely for sanity-checking and copy/
+  paste into support tickets.
+
 ## 2.1.1 — 2026-04-19
 
 ### Added

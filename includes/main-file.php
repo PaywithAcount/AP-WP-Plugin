@@ -209,6 +209,33 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
     }
 
     /**
+     * Returns an AcountPay_API instance configured against the merchant's
+     * currently-saved api_base_url / SSL settings.
+     *
+     * Critical: get_supported_banks() and get_bank_logo_urls() previously
+     * instantiated AcountPay_API() with no arguments, which silently pinned
+     * every public-bank lookup to the hardcoded production URL even when
+     * the merchant had configured a sandbox / staging / ngrok host. Live
+     * logos then never resolved on those environments and the carousel
+     * fell back to the bundled placeholder SVGs (which look like text).
+     *
+     * @return AcountPay_API|null
+     */
+    private function get_api_for_banks()
+    {
+        if (isset($this->api) && $this->api instanceof AcountPay_API) {
+            return $this->api;
+        }
+        if (!class_exists('AcountPay_API')) {
+            return null;
+        }
+        $api_base_url      = $this->get_option('api_base_url', 'https://api.acountpay.com');
+        $logging_enabled   = $this->get_option('logging', 'no') === 'yes';
+        $sslverify_enabled = $this->get_option('sslverify', 'yes') === 'yes';
+        return new AcountPay_API($api_base_url, $logging_enabled, $sslverify_enabled);
+    }
+
+    /**
      * Build the full options map (bankId => display name) for the merchant's
      * configured country. Live AcountPay data is preferred — bundled fallback
      * fills the gaps so the settings screen and carousel keep working offline.
@@ -222,8 +249,8 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         $bundled      = $this->get_bundled_banks_fallback();
 
         $live = array();
-        if (class_exists('AcountPay_API')) {
-            $api    = new AcountPay_API();
+        $api  = $this->get_api_for_banks();
+        if ($api) {
             $result = $api->get_country_banks($country_code);
             if (is_array($result)) {
                 foreach ($result as $row) {
@@ -313,8 +340,8 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
 
         // Build a lookup of live logoUrls keyed by bankId.
         $live_urls = array();
-        if (class_exists('AcountPay_API')) {
-            $api    = new AcountPay_API();
+        $api       = $this->get_api_for_banks();
+        if ($api) {
             $result = $api->get_country_banks($country_code);
             if (is_array($result)) {
                 foreach ($result as $row) {
@@ -351,6 +378,101 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         }
 
         return apply_filters('woocommerce_acountpay_bank_logos', $urls, $this->id);
+    }
+
+    /**
+     * Build the payment reference string that will be sent to AcountPay as
+     * `referenceNumber`, then forwarded to Token.io as `displayReference` →
+     * `remittanceInformationPrimary`. This is what the PSU sees on their bank
+     * statement next to the transaction.
+     *
+     * Why this matters: by default the plugin used to send the bare Woo order
+     * number (e.g. "1234"), so customers saw a meaningless integer on their
+     * statement. Letting the merchant configure a template like
+     * `Acme Shop #{order_number}` means the customer recognises the charge,
+     * which cuts down chargeback / "what was this?" support tickets.
+     *
+     * Bank constraints are enforced two ways:
+     *   1. Here we sanitize to a conservative ASCII-friendly charset
+     *      (alnum + space + hyphen + dot + hash + underscore + slash). This
+     *      keeps every bank happy and avoids unexpected sanitization on the
+     *      backend swallowing parts of the merchant's reference.
+     *   2. The backend (`payment-rails.config.ts`) further sanitizes per-bank
+     *      and truncates to each bank's `maxRemittancePrimaryLen` (typically
+     *      25–40 chars). We pre-truncate to the merchant-configured cap
+     *      (default 18) so a long template doesn't get silently cut by
+     *      the bank into something nonsensical.
+     *
+     * Placeholders supported:
+     *   {order_number}   → WC_Order::get_order_number() (respects Woo Sequential)
+     *   {order_id}       → WC_Order::get_id() (raw post id)
+     *   {site_title}     → WordPress site name (get_bloginfo('name'))
+     *   {first_name}     → Billing first name
+     *   {last_name}      → Billing last name
+     *
+     * @param WC_Order $order
+     * @return string
+     */
+    public function build_payment_reference($order)
+    {
+        if (!$order instanceof WC_Order) {
+            return '';
+        }
+
+        $template = (string) $this->get_option('payment_reference_template', '{site_title} #{order_number}');
+        $template = trim($template);
+        if ($template === '') {
+            // Fallback: bare order number — preserves pre-2.1.4 behaviour for
+            // merchants who explicitly cleared the field.
+            return (string) $order->get_order_number();
+        }
+
+        $replacements = array(
+            '{order_number}' => (string) $order->get_order_number(),
+            '{order_id}'     => (string) $order->get_id(),
+            '{site_title}'   => (string) get_bloginfo('name'),
+            '{first_name}'   => (string) $order->get_billing_first_name(),
+            '{last_name}'    => (string) $order->get_billing_last_name(),
+        );
+        $rendered = strtr($template, $replacements);
+
+        // Strip any leftover {placeholder} tokens the merchant may have typed
+        // (typos, unsupported names) so they don't leak through onto the
+        // statement as literal "{foo}".
+        $rendered = preg_replace('/\{[a-z_]+\}/i', '', (string) $rendered);
+
+        // Conservative charset: keep alnum, space, hyphen, dot, hash,
+        // underscore, slash. Most banks accept all of these; everything else
+        // (curly braces, asterisks, emoji, etc.) gets dropped silently here
+        // rather than at the bank's edge where it can cause confusing partial
+        // truncations.
+        $rendered = preg_replace('/[^A-Za-z0-9 #\-_\/.]/', '', (string) $rendered);
+        $rendered = preg_replace('/\s+/', ' ', (string) $rendered);
+        $rendered = trim((string) $rendered);
+
+        $max_len  = (int) $this->get_option('payment_reference_max_length', 18);
+        if ($max_len < 6) {
+            $max_len = 6;
+        } elseif ($max_len > 35) {
+            // Above 35 chars most banks truncate anyway — clamp here so the
+            // backend doesn't have to.
+            $max_len = 35;
+        }
+        if (function_exists('mb_substr')) {
+            $rendered = mb_substr($rendered, 0, $max_len, 'UTF-8');
+        } else {
+            $rendered = substr($rendered, 0, $max_len);
+        }
+        $rendered = trim($rendered);
+
+        if ($rendered === '') {
+            // Sanitization wiped everything (template was all unsupported
+            // chars). Fall back to the bare order number rather than sending
+            // an empty referenceNumber, which the backend would reject.
+            return (string) $order->get_order_number();
+        }
+
+        return apply_filters('woocommerce_acountpay_payment_reference', $rendered, $order, $this->id);
     }
 
     /**
@@ -582,6 +704,30 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                 'default' => 'no',
                 'desc_tip' => true,
             ],
+            'payment_reference_template' => [
+                'title'       => __('Payment reference (shown on customer\'s bank statement)', ACOUNTPAY_TEXT_DOMAIN),
+                'type'        => 'text',
+                'description' => sprintf(
+                    /* translators: 1: list of placeholders, 2: example output */
+                    __('This text is sent to the customer\'s bank as the payment reference (remittance information) and is what they will see on their bank statement next to the transaction. Use placeholders to inject order data: %1$s. Example: %2$s. Leave blank to fall back to the bare WooCommerce order number.', ACOUNTPAY_TEXT_DOMAIN),
+                    '<code>{order_number}</code>, <code>{order_id}</code>, <code>{site_title}</code>, <code>{first_name}</code>, <code>{last_name}</code>',
+                    '<code>' . esc_html(get_bloginfo('name') ?: 'My Shop') . ' #1234</code>'
+                ),
+                'default'     => '{site_title} #{order_number}',
+                'placeholder' => '{site_title} #{order_number}',
+            ],
+            'payment_reference_max_length' => [
+                'title'       => __('Payment reference max length', ACOUNTPAY_TEXT_DOMAIN),
+                'type'        => 'number',
+                'description' => __('Banks enforce per-rail character limits on the remittance text. The plugin truncates the rendered reference to this many characters before sending it to AcountPay. Recommended values: 18 (safe across all supported FI/DK banks), 25 (Danske Bank cap, OBIE rails), 35 (Aktia / OP / S-Pankki / Ålandsbanken / Wise), 40 (Nordea Denmark / Nordea Finland Business). Anything above 35 will be truncated by most banks. Note: Oma / POP / Säästöpankki strip non-digits from the structured reference, but the remittance text remains visible to the PSU.', ACOUNTPAY_TEXT_DOMAIN),
+                'default'     => '18',
+                'custom_attributes' => array(
+                    'min'  => '6',
+                    'max'  => '35',
+                    'step' => '1',
+                ),
+                'desc_tip'    => true,
+            ],
             'client_id' => [
                 'title' => __('Client ID', ACOUNTPAY_TEXT_DOMAIN),
                 'type' => 'text',
@@ -673,7 +819,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         $webhook_url = function_exists('WC') ? esc_url(WC()->api_request_url('acountpay_webhook')) : '';
         $defaults = array(
             'title'       => __('Webhook URL', ACOUNTPAY_TEXT_DOMAIN),
-            'description' => __('Paste this URL into your AcountPay Merchant Dashboard → Developer → Webhook URL. AcountPay will POST signed payment status updates here.', ACOUNTPAY_TEXT_DOMAIN),
+            'description' => __('This is the URL your store listens on for payment status updates. The plugin sends it to AcountPay automatically with every Pay-by-Bank checkout — there is no separate webhook field to fill in on the AcountPay Merchant Dashboard. Keep it copyable here so support can verify the URL is reachable from the public internet.', ACOUNTPAY_TEXT_DOMAIN),
         );
         $data = wp_parse_args($data, $defaults);
         ob_start();
@@ -921,11 +1067,27 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         }
 
         $previous_country = strtoupper((string) $this->get_option('bank_country', 'FI'));
+        $previous_api_url = (string) $this->get_option('api_base_url', 'https://api.acountpay.com');
+
         parent::process_admin_options();
+
         $new_country = strtoupper((string) $this->get_option('bank_country', 'FI'));
-        if ($previous_country !== $new_country) {
-            delete_transient('acountpay_banks_' . strtolower($previous_country));
-            delete_transient('acountpay_banks_' . strtolower($new_country));
+        $new_api_url = (string) $this->get_option('api_base_url', 'https://api.acountpay.com');
+
+        // Bust the bank transient when the merchant switches country OR
+        // changes the API base URL. Without the second branch a merchant
+        // who flips from prod → sandbox (or vice-versa) keeps seeing the
+        // old environment's logo set for up to 24h, and any merchant who
+        // upgraded from a build with the broken (un-versioned) logos
+        // endpoint would be stuck looking at bundled placeholders until
+        // the cache naturally expired.
+        if ($previous_country !== $new_country || $previous_api_url !== $new_api_url) {
+            $prev_key = 'acountpay_banks_' . strtolower($previous_country);
+            $new_key  = 'acountpay_banks_' . strtolower($new_country);
+            delete_transient($prev_key);
+            delete_transient($new_key);
+            delete_transient($prev_key . '_stale');
+            delete_transient($new_key . '_stale');
         }
     }
 
@@ -967,8 +1129,15 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             return;
         }
 
-        $currency         = strtoupper($order->get_currency());
-        $reference_number = (string) $order->get_order_number();
+        $currency = strtoupper($order->get_currency());
+        // Reuse the reference we stored at process_payment time so retries
+        // from My Account → Pay show the *same* text on the customer's bank
+        // statement as their original attempt — otherwise a merchant who
+        // edited the template between attempts would confuse reconciliation.
+        $reference_number = (string) $order->get_meta('_acountpay_reference_number');
+        if ($reference_number === '') {
+            $reference_number = $this->build_payment_reference($order);
+        }
 
         $idempotency_key = $order->get_meta('_acountpay_idempotency_key');
         if (empty($idempotency_key)) {
@@ -1012,6 +1181,12 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                 $order->set_transaction_id($payment_id);
                 $callback_url = $this->build_signed_callback_url($order_id, $reference_number, $payment_id);
                 $redirect_url = $this->maybe_replace_redirect_callback($redirect_url, $callback_url);
+            }
+            // Persist the rendered PSU-visible reference so any later retry
+            // (My Account → Pay) reuses the exact same string we just sent
+            // — see receipt_page() above.
+            if ((string) $order->get_meta('_acountpay_reference_number') === '') {
+                $order->update_meta_data('_acountpay_reference_number', $reference_number);
             }
             $order->update_meta_data('_acountpay_pos_url', $redirect_url);
             $order->update_meta_data('_acountpay_link_created_at', time());
@@ -1209,7 +1384,12 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             $order->update_meta_data('_acountpay_idempotency_key', $idempotency_key);
         }
 
-        $reference_number = (string) $order->get_order_number();
+        // PSU-visible bank-statement text. Built from the merchant's
+        // configurable template (Settings → Payment reference) so customers
+        // see e.g. "Acme Shop #1234" on their bank statement instead of a
+        // bare "1234". The backend forwards this verbatim to Token.io as
+        // remittanceInformationPrimary, then sanitizes / truncates per-bank.
+        $reference_number = $this->build_payment_reference($order);
         $description      = sprintf(__('Payment for order #%s', ACOUNTPAY_TEXT_DOMAIN), $order->get_order_number());
         $callback_url     = $this->build_signed_callback_url($order_id, $reference_number);
         $webhook_url      = add_query_arg('order_id', $order_id, WC()->api_request_url('acountpay_webhook'));
