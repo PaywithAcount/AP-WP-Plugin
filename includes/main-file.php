@@ -202,15 +202,38 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
     public function get_bundled_banks_fallback()
     {
         return array(
-            'ngp-okoy'        => array('name' => 'OP Pohjola',                'svg' => 'op.svg',               'aliases' => array('op')),
-            'ngp-ndeafi'      => array('name' => 'Nordea Bank',               'svg' => 'nordea.svg',           'aliases' => array('nordea')),
-            'ob-danske-fin'   => array('name' => 'Danske Bank',               'svg' => 'danske-bank.svg',      'aliases' => array('danske-bank')),
-            'ob-spanfi'       => array('name' => 'S-Pankki',                  'svg' => 's-pankki.svg',         'aliases' => array('s-pankki')),
-            'ob-aktia'        => array('name' => 'Aktia',                     'svg' => 'aktia.svg',            'aliases' => array('aktia')),
-            'ngp-saot'        => array('name' => 'Säästöpankki',              'svg' => 'saastopankki.svg',     'aliases' => array('saastopankki')),
-            'ngp-popf'        => array('name' => 'POP Pankki',                'svg' => 'pop-pankki.svg',       'aliases' => array('pop-pankki')),
-            'ob-alanfi'       => array('name' => 'Ålandsbanken',              'svg' => 'alandsbanken.svg',     'aliases' => array('alandsbanken')),
-            'ngp-omsa'        => array('name' => 'Oma Säästöpankki',          'svg' => 'oma-saastopankki.svg', 'aliases' => array('oma-saastopankki')),
+            // Finland (FI). SVGs ship under assets/images/banks/.
+            'ngp-okoy'         => array('country' => 'FI', 'name' => 'OP Pohjola',         'svg' => 'op.svg',               'aliases' => array('op')),
+            'ngp-ndeafi'       => array('country' => 'FI', 'name' => 'Nordea Bank',        'svg' => 'nordea.svg',           'aliases' => array('nordea')),
+            'ob-danske-fin'    => array('country' => 'FI', 'name' => 'Danske Bank - Personal', 'svg' => 'danske-bank.svg',  'aliases' => array('danske-bank')),
+            'ob-danske-fin-bus'=> array('country' => 'FI', 'name' => 'Danske Bank - Business', 'svg' => 'danske-bank.svg',  'aliases' => array('danske-bank-business')),
+            'ob-spanfi'        => array('country' => 'FI', 'name' => 'S-Pankki',           'svg' => 's-pankki.svg',         'aliases' => array('s-pankki')),
+            'ob-aktia'         => array('country' => 'FI', 'name' => 'Aktia',              'svg' => 'aktia.svg',            'aliases' => array('aktia')),
+            'ngp-saot'         => array('country' => 'FI', 'name' => 'Säästöpankki',       'svg' => 'saastopankki.svg',     'aliases' => array('saastopankki')),
+            'ngp-popf'         => array('country' => 'FI', 'name' => 'POP Pankki',         'svg' => 'pop-pankki.svg',       'aliases' => array('pop-pankki')),
+            'ob-alanfi'        => array('country' => 'FI', 'name' => 'Ålandsbanken',       'svg' => 'alandsbanken.svg',     'aliases' => array('alandsbanken')),
+            'ngp-omsa'         => array('country' => 'FI', 'name' => 'Oma Säästöpankki',   'svg' => 'oma-saastopankki.svg', 'aliases' => array('oma-saastopankki')),
+            // Multi-country EEA banks that Token.io exposes for FI as well as DK
+            // (and many other countries). No bundled SVG; live CDN logo URLs
+            // come from AcountPay's /v1/banks/public/logos endpoint, which
+            // serves these from Token.io's CloudFront CDN.
+            'ob-revolut-eea'   => array('country' => 'FI', 'name' => 'Revolut',            'svg' => '', 'aliases' => array('revolut')),
+            'ngp-ntsb'         => array('country' => 'FI', 'name' => 'N26',                'svg' => '', 'aliases' => array('n26')),
+            'ob-wise-eea'      => array('country' => 'FI', 'name' => 'Wise',               'svg' => '', 'aliases' => array('wise')),
+
+            // Denmark (DK). The plugin doesn't ship DK SVGs yet; these entries
+            // exist so the settings multiselect is non-empty for a DK store
+            // when the backend's /v1/banks/public/logos endpoint returns no
+            // rows. Live CDN logo URLs come from AcountPay once those rows are
+            // populated, so the carousel renders correctly without a plugin
+            // update.
+            'ob-danske-dnk'    => array('country' => 'DK', 'name' => 'Danske Bank',          'svg' => '', 'aliases' => array('danske-bank-dk')),
+            'ob-danske-dnk-bus'=> array('country' => 'DK', 'name' => 'Danske Bank Business', 'svg' => '', 'aliases' => array('danske-bank-business')),
+            'ngp-ndeadk'       => array('country' => 'DK', 'name' => 'Nordea Bank',          'svg' => '', 'aliases' => array('nordea-dk')),
+            'ngp-jyske'        => array('country' => 'DK', 'name' => 'Jyske Bank',           'svg' => '', 'aliases' => array('jyske-bank')),
+            'ngp-sybk'         => array('country' => 'DK', 'name' => 'Sydbank',              'svg' => '', 'aliases' => array('sydbank')),
+            'ngp-spno'         => array('country' => 'DK', 'name' => 'Spar Nord',            'svg' => '', 'aliases' => array('spar-nord')),
+            'ngp-nykb'         => array('country' => 'DK', 'name' => 'Nykredit',             'svg' => '', 'aliases' => array('nykredit')),
         );
     }
 
@@ -242,50 +265,116 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
     }
 
     /**
-     * Build the full options map (bankId => display name) for the merchant's
-     * configured country. Live AcountPay data is preferred — bundled fallback
-     * fills the gaps so the settings screen and carousel keep working offline.
+     * Normalise the merchant's "Bank country" setting to a sanitised list of
+     * ISO-3166-1 alpha-2 codes. Tolerates both the legacy single-string shape
+     * (pre-2.1.7 the field was a select that stored "FI" or "DK") and the
+     * current multi-select array shape, so the upgrade is zero-touch.
      *
-     * @param string $country_code ISO-3166-1 alpha-2 (defaults to merchant setting → "FI").
+     * @return string[] non-empty list of upper-cased 2-letter codes (defaults to ['FI','DK'])
+     */
+    public function get_bank_countries()
+    {
+        $raw = $this->get_option('bank_country', array('FI', 'DK'));
+
+        // Legacy: single-string select value from <2.1.7.
+        if (is_string($raw)) {
+            $raw = $raw === '' ? array() : array($raw);
+        }
+        if (!is_array($raw)) {
+            $raw = array();
+        }
+
+        $allowed = array('FI', 'DK');
+        $clean   = array();
+        foreach ($raw as $code) {
+            $code = strtoupper(substr((string) $code, 0, 2));
+            if (in_array($code, $allowed, true) && !in_array($code, $clean, true)) {
+                $clean[] = $code;
+            }
+        }
+        return !empty($clean) ? $clean : array('FI', 'DK');
+    }
+
+    /**
+     * Build the full options map (bankId => display name) for the merchant's
+     * configured countries. Live AcountPay data is preferred — bundled fallback
+     * fills the gaps so the settings screen and carousel keep working offline,
+     * including for countries whose backend rows are not yet logo-populated.
+     *
+     * Accepts either:
+     *   - null                → reads ['FI','DK'] from the merchant setting
+     *   - string              → single country (back-compat)
+     *   - string[]            → list of countries (multi-country mode)
+     *
+     * @param null|string|string[] $countries
      * @return array<string,string>
      */
-    public function get_supported_banks($country_code = null)
+    public function get_supported_banks($countries = null)
     {
-        $country_code = strtoupper((string) ($country_code ?: $this->get_option('bank_country', 'FI')));
-        $bundled      = $this->get_bundled_banks_fallback();
+        if ($countries === null) {
+            $countries = $this->get_bank_countries();
+        } elseif (is_string($countries)) {
+            $countries = array($countries);
+        } elseif (!is_array($countries)) {
+            $countries = $this->get_bank_countries();
+        }
 
-        $live = array();
-        $api  = $this->get_api_for_banks();
+        // Sanitise + de-dupe.
+        $clean_countries = array();
+        foreach ($countries as $cc) {
+            $cc = strtoupper(substr((string) $cc, 0, 2));
+            if ($cc !== '' && !in_array($cc, $clean_countries, true)) {
+                $clean_countries[] = $cc;
+            }
+        }
+        if (empty($clean_countries)) {
+            $clean_countries = array('FI');
+        }
+
+        $bundled = $this->get_bundled_banks_fallback();
+        $api     = $this->get_api_for_banks();
+
+        // Pull live results per country and merge, preserving the live-first
+        // ordering inside each country block.
+        $live      = array();
+        $live_seen = false;
         if ($api) {
-            $result = $api->get_country_banks($country_code);
-            if (is_array($result)) {
-                foreach ($result as $row) {
-                    if (empty($row['bankId'])) {
-                        continue;
+            foreach ($clean_countries as $cc) {
+                $result = $api->get_country_banks($cc);
+                if (is_array($result)) {
+                    $live_seen = true;
+                    foreach ($result as $row) {
+                        if (empty($row['bankId'])) {
+                            continue;
+                        }
+                        $live[$row['bankId']] = !empty($row['name']) ? $row['name'] : $row['bankId'];
                     }
-                    $live[$row['bankId']] = !empty($row['name']) ? $row['name'] : $row['bankId'];
                 }
             }
         }
 
-        // Live first (preserves API ordering), then any bundled rows the API
-        // didn't return — only if we actually got live data; otherwise fall
-        // back to the full bundled list so the settings UI is never empty.
-        if (!empty($live)) {
-            $supported = $live;
-            foreach ($bundled as $bankId => $meta) {
-                if (!isset($supported[$bankId])) {
-                    $supported[$bankId] = $meta['name'];
-                }
+        // Live first, then any bundled rows whose `country` matches one of the
+        // selected countries — so DK installs don't see Finnish banks unless
+        // they explicitly opted in. If the API returned nothing for any of the
+        // selected countries, fall back to the country-filtered bundled list
+        // so the settings UI is never empty.
+        $supported = $live;
+        foreach ($bundled as $bankId => $meta) {
+            $bundled_cc = isset($meta['country']) ? strtoupper((string) $meta['country']) : 'FI';
+            if (!in_array($bundled_cc, $clean_countries, true)) {
+                continue;
             }
-        } else {
-            $supported = array();
-            foreach ($bundled as $bankId => $meta) {
+            if (!isset($supported[$bankId])) {
                 $supported[$bankId] = $meta['name'];
             }
         }
 
-        return apply_filters('woocommerce_acountpay_supported_banks', $supported, $country_code, $this->id);
+        return apply_filters(
+            'woocommerce_acountpay_supported_banks',
+            $supported,
+            $clean_countries, // now a list — older filters that expected a string still get something truthy
+            $this->id
+        );
     }
 
     /**
@@ -334,9 +423,9 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
      */
     public function get_bank_logo_urls()
     {
-        $country_code = strtoupper((string) $this->get_option('bank_country', 'FI'));
-        $supported    = $this->get_supported_banks($country_code);
-        $bundled      = $this->get_bundled_banks_fallback();
+        $countries = $this->get_bank_countries();
+        $supported = $this->get_supported_banks($countries);
+        $bundled   = $this->get_bundled_banks_fallback();
 
         $stored   = $this->get_option('bank_logos', array_keys($supported));
         $selected = $this->normalize_selected_bank_ids($stored);
@@ -344,15 +433,18 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             $selected = array_keys($supported);
         }
 
-        // Build a lookup of live logoUrls keyed by bankId.
+        // Build a lookup of live logoUrls keyed by bankId across every selected
+        // country, so a multi-country merchant gets a unified map.
         $live_urls = array();
         $api       = $this->get_api_for_banks();
         if ($api) {
-            $result = $api->get_country_banks($country_code);
-            if (is_array($result)) {
-                foreach ($result as $row) {
-                    if (!empty($row['bankId']) && !empty($row['logoUrl'])) {
-                        $live_urls[$row['bankId']] = $row['logoUrl'];
+            foreach ($countries as $cc) {
+                $result = $api->get_country_banks($cc);
+                if (is_array($result)) {
+                    foreach ($result as $row) {
+                        if (!empty($row['bankId']) && !empty($row['logoUrl'])) {
+                            $live_urls[$row['bankId']] = $row['logoUrl'];
+                        }
                     }
                 }
             }
@@ -365,7 +457,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             $url = '';
             if (!empty($live_urls[$bankId])) {
                 $url = $live_urls[$bankId];
-            } elseif (isset($bundled[$bankId])) {
+            } elseif (isset($bundled[$bankId]) && !empty($bundled[$bankId]['svg'])) {
                 $relative = 'assets/images/banks/' . $bundled[$bankId]['svg'];
                 $absolute = ACOUNTPAY_PAYMENT_PLUGIN_PATH . $relative;
                 if (file_exists($absolute)) {
@@ -373,6 +465,10 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                 }
             }
             if ($url === '') {
+                // No live CDN URL and no bundled SVG — skip from the carousel
+                // (still appears in the settings multiselect, just not rendered
+                // as a logo at checkout). Common case: a DK bank whose logo_url
+                // hasn't been backfilled in the AcountPay database yet.
                 continue;
             }
 
@@ -648,8 +744,8 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
      */
     public function init_form_fields()
     {
-        $bank_country    = strtoupper((string) $this->get_option('bank_country', 'FI'));
-        $supported_banks = $this->get_supported_banks($bank_country);
+        $bank_countries  = $this->get_bank_countries();
+        $supported_banks = $this->get_supported_banks($bank_countries);
 
         $form_fields = apply_filters('woo_acountpay_payment', [
             'enabled' => [
@@ -673,10 +769,12 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                 'desc_tip' => true
             ],
             'bank_country' => [
-                'title'       => __('Bank country', ACOUNTPAY_TEXT_DOMAIN),
-                'type'        => 'select',
-                'description' => __('Country whose banks AcountPay should offer. Picks the live bank list (and CDN logos) used by the carousel below.', ACOUNTPAY_TEXT_DOMAIN),
-                'default'     => 'FI',
+                'title'       => __('Bank countries', ACOUNTPAY_TEXT_DOMAIN),
+                'type'        => 'multiselect',
+                'class'       => 'wc-enhanced-select',
+                'css'         => 'min-width: 250px;',
+                'description' => __('Countries whose banks AcountPay should offer. Hold ⌘/Ctrl to pick more than one — useful for Nordic stores that accept both Finnish and Danish bank logins. Drives the live bank list (and CDN logos) used by the carousel below. Save the page after changing countries; the bank list refreshes automatically.', ACOUNTPAY_TEXT_DOMAIN),
+                'default'     => array('FI', 'DK'),
                 'desc_tip'    => true,
                 'options'     => array(
                     'FI' => __('Finland', ACOUNTPAY_TEXT_DOMAIN),
@@ -1009,8 +1107,20 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                         var fd = new FormData();
                         fd.append('action', 'acountpay_refresh_banks');
                         fd.append('_wpnonce', btn.dataset.nonce);
+                        // bank_country is now a multi-select; collect every
+                        // selected option and append as country[]= so the
+                        // backend AJAX handler refreshes all of them in one
+                        // round-trip. Falls back to a single 'FI' if the
+                        // multiselect isn't on the page (defensive).
                         var countryEl = document.getElementById('woocommerce_acountpay_payment_bank_country');
-                        if (countryEl) { fd.append('country', countryEl.value || 'FI'); }
+                        var selected = [];
+                        if (countryEl && countryEl.options) {
+                            for (var i = 0; i < countryEl.options.length; i++) {
+                                if (countryEl.options[i].selected) selected.push(countryEl.options[i].value);
+                            }
+                        }
+                        if (!selected.length) selected = ['FI', 'DK'];
+                        selected.forEach(function(cc){ fd.append('country[]', cc); });
                         fetch(ajaxurl, { method: 'POST', credentials: 'same-origin', body: fd })
                             .then(function(r){ return r.text().then(function(t){ return { status: r.status, text: t }; }); })
                             .then(function(resp){
@@ -1063,47 +1173,78 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         }
         check_ajax_referer('acountpay_refresh_banks');
 
-        $country = isset($_POST['country']) ? strtoupper(substr(sanitize_text_field(wp_unslash($_POST['country'])), 0, 2)) : '';
-        if ($country === '') {
-            $country = strtoupper((string) $this->get_option('bank_country', 'FI'));
+        // Accept both shapes:
+        //   country=DK              (legacy single-country payload)
+        //   country[]=FI&country[]=DK  (current multi-country payload from JS)
+        $countries = array();
+        if (isset($_POST['country'])) {
+            $raw = wp_unslash($_POST['country']);
+            if (is_array($raw)) {
+                foreach ($raw as $cc) {
+                    $cc = strtoupper(substr(sanitize_text_field((string) $cc), 0, 2));
+                    if ($cc !== '' && !in_array($cc, $countries, true)) {
+                        $countries[] = $cc;
+                    }
+                }
+            } else {
+                $cc = strtoupper(substr(sanitize_text_field((string) $raw), 0, 2));
+                if ($cc !== '') $countries[] = $cc;
+            }
         }
-
-        // Drop both the 24h "fresh" cache *and* the 7d "stale" fallback so a
-        // truly forced refresh isn't masked by yesterday's empty list.
-        $cache_key = 'acountpay_banks_' . strtolower($country);
-        delete_transient($cache_key);
-        delete_transient($cache_key . '_stale');
+        if (empty($countries)) {
+            $countries = $this->get_bank_countries();
+        }
 
         $api = $this->get_api_for_banks();
         if (!$api) {
             wp_send_json_error(array('message' => __('API client could not be initialised — check that the AcountPay plugin is active.', ACOUNTPAY_TEXT_DOMAIN)));
         }
 
-        $result = $api->get_country_banks($country, true);
-        if (is_wp_error($result)) {
-            $api_base = method_exists($api, 'get_api_base_url') ? $api->get_api_base_url() : '';
-            $endpoint = '/v1/banks/public/logos?country=' . $country;
-            $detail   = $result->get_error_message();
-            if ($detail === '') {
-                $detail = $result->get_error_code();
-            }
-            wp_send_json_error(array(
-                'message' => sprintf(
-                    /* translators: %1$s = full URL the plugin pinged, %2$s = upstream error message */
-                    __('Could not load banks from %1$s — %2$s', ACOUNTPAY_TEXT_DOMAIN),
-                    rtrim($api_base, '/') . $endpoint,
+        $api_base    = method_exists($api, 'get_api_base_url') ? $api->get_api_base_url() : '';
+        $totals      = array();
+        $errors      = array();
+        foreach ($countries as $cc) {
+            // Drop both the 24h "fresh" cache *and* the 7d "stale" fallback
+            // so a truly forced refresh isn't masked by yesterday's list.
+            $cache_key = 'acountpay_banks_' . strtolower($cc);
+            delete_transient($cache_key);
+            delete_transient($cache_key . '_stale');
+
+            $result = $api->get_country_banks($cc, true);
+            if (is_wp_error($result)) {
+                $detail = $result->get_error_message();
+                if ($detail === '') $detail = $result->get_error_code();
+                $errors[$cc] = sprintf(
+                    /* translators: %1$s = country code, %2$s = full URL pinged, %3$s = upstream error */
+                    __('%1$s: could not load from %2$s — %3$s', ACOUNTPAY_TEXT_DOMAIN),
+                    $cc,
+                    rtrim($api_base, '/') . '/v1/banks/public/logos?country=' . $cc,
                     $detail
-                ),
-            ));
+                );
+                continue;
+            }
+            $totals[$cc] = is_array($result) ? count($result) : 0;
         }
-        wp_send_json_success(array(
-            'message' => sprintf(
-                /* translators: %1$d count of banks, %2$s country code */
-                __('%1$d banks loaded for %2$s', ACOUNTPAY_TEXT_DOMAIN),
-                count($result),
-                $country
-            ),
-        ));
+
+        if (!empty($errors) && empty($totals)) {
+            // Every country failed.
+            wp_send_json_error(array('message' => implode(' · ', $errors)));
+        }
+
+        $parts = array();
+        foreach ($totals as $cc => $count) {
+            $parts[] = sprintf('%d %s', $count, $cc);
+        }
+        $message = sprintf(
+            /* translators: %s = list of "<count> <CC>" pairs e.g. "11 FI · 7 DK" */
+            __('Loaded: %s', ACOUNTPAY_TEXT_DOMAIN),
+            implode(' · ', $parts)
+        );
+        if (!empty($errors)) {
+            // Partial success — surface which country(ies) failed.
+            $message .= ' · ' . implode(' · ', $errors);
+        }
+        wp_send_json_success(array('message' => $message));
     }
 
     /**
@@ -1119,28 +1260,32 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             unset($_POST[$post_key]);
         }
 
-        $previous_country = strtoupper((string) $this->get_option('bank_country', 'FI'));
-        $previous_api_url = (string) $this->get_option('api_base_url', 'https://api.acountpay.com');
+        $previous_countries = $this->get_bank_countries();
+        $previous_api_url   = (string) $this->get_option('api_base_url', 'https://api.acountpay.com');
 
         parent::process_admin_options();
 
-        $new_country = strtoupper((string) $this->get_option('bank_country', 'FI'));
-        $new_api_url = (string) $this->get_option('api_base_url', 'https://api.acountpay.com');
+        $new_countries = $this->get_bank_countries();
+        $new_api_url   = (string) $this->get_option('api_base_url', 'https://api.acountpay.com');
 
-        // Bust the bank transient when the merchant switches country OR
-        // changes the API base URL. Without the second branch a merchant
-        // who flips from prod → sandbox (or vice-versa) keeps seeing the
-        // old environment's logo set for up to 24h, and any merchant who
-        // upgraded from a build with the broken (un-versioned) logos
-        // endpoint would be stuck looking at bundled placeholders until
-        // the cache naturally expired.
-        if ($previous_country !== $new_country || $previous_api_url !== $new_api_url) {
-            $prev_key = 'acountpay_banks_' . strtolower($previous_country);
-            $new_key  = 'acountpay_banks_' . strtolower($new_country);
-            delete_transient($prev_key);
-            delete_transient($new_key);
-            delete_transient($prev_key . '_stale');
-            delete_transient($new_key . '_stale');
+        // Bust bank transients when the merchant changes the country list OR
+        // changes the API base URL. Compare as sorted-string sets so order
+        // changes alone don't trigger a flush. Flushing the union of old +
+        // new countries (rather than just the symmetric difference) is the
+        // safe choice: a merchant who deselected DK should also see the FI
+        // list re-pulled in case a logo was added there too.
+        sort($previous_countries);
+        sort($new_countries);
+        $countries_changed = $previous_countries !== $new_countries;
+        $api_url_changed   = $previous_api_url !== $new_api_url;
+
+        if ($countries_changed || $api_url_changed) {
+            $to_flush = array_unique(array_merge($previous_countries, $new_countries));
+            foreach ($to_flush as $cc) {
+                $key = 'acountpay_banks_' . strtolower($cc);
+                delete_transient($key);
+                delete_transient($key . '_stale');
+            }
         }
     }
 

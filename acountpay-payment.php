@@ -6,7 +6,7 @@
  * Author:      AcountPay
  * Author URI:  https://acountpay.com
  * Description: Pay by Bank for WooCommerce, powered by AcountPay. Lets shoppers pay directly from their bank account via PSD2 / open banking, with a configurable bank-logo carousel, classic + block checkout support, signed callbacks, signed server-to-server webhooks, an order-edit panel showing payment id and PSU lookup state, and a manual-refund flow driven from the AcountPay Merchant Dashboard.
- * Version:     2.1.6
+ * Version:     2.1.8
  * Requires at least: 5.8
  * Tested up to: 6.9.1
  * Requires PHP: 7.4
@@ -23,7 +23,7 @@ if (!defined('ABSPATH')) {
 }
 
 //define the plugin constants
-define('ACOUNTPAY_PAYMENT_VERSION', '2.1.6');
+define('ACOUNTPAY_PAYMENT_VERSION', '2.1.8');
 define('ACOUNTPAY_PAYMENT_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('ACOUNTPAY_PAYMENT_PLUGIN_PATH', plugin_dir_path(__FILE__));
 define('ACOUNTPAY_TEXT_DOMAIN', 'acountpay-payment');
@@ -162,31 +162,71 @@ function acountpay_ajax_proxy_refresh_banks()
     }
     check_ajax_referer('acountpay_refresh_banks');
 
-    $opts    = acountpay_get_settings();
-    $country = isset($_POST['country']) ? strtoupper(substr(sanitize_text_field(wp_unslash($_POST['country'])), 0, 2)) : '';
-    if ($country === '') {
-        $country = isset($opts['bank_country']) ? strtoupper((string) $opts['bank_country']) : 'FI';
-    }
+    $opts = acountpay_get_settings();
 
-    $cache_key = 'acountpay_banks_' . strtolower($country);
-    delete_transient($cache_key);
-    delete_transient($cache_key . '_stale');
+    // Accept country=DK (legacy) or country[]=FI&country[]=DK (multi).
+    $countries = array();
+    if (isset($_POST['country'])) {
+        $raw = wp_unslash($_POST['country']);
+        if (is_array($raw)) {
+            foreach ($raw as $cc) {
+                $cc = strtoupper(substr(sanitize_text_field((string) $cc), 0, 2));
+                if ($cc !== '' && !in_array($cc, $countries, true)) $countries[] = $cc;
+            }
+        } else {
+            $cc = strtoupper(substr(sanitize_text_field((string) $raw), 0, 2));
+            if ($cc !== '') $countries[] = $cc;
+        }
+    }
+    if (empty($countries)) {
+        // Fall back to whatever is saved in settings, tolerating both shapes
+        // (string from <2.1.7 installs, array from current installs).
+        $saved = isset($opts['bank_country']) ? $opts['bank_country'] : array('FI', 'DK');
+        if (is_string($saved)) $saved = array($saved);
+        if (!is_array($saved)) $saved = array('FI', 'DK');
+        foreach ($saved as $cc) {
+            $cc = strtoupper(substr((string) $cc, 0, 2));
+            if ($cc !== '' && !in_array($cc, $countries, true)) $countries[] = $cc;
+        }
+        if (empty($countries)) $countries = array('FI', 'DK');
+    }
 
     $api = acountpay_make_api_client();
     if (!$api) {
         wp_send_json_error(array('message' => 'AcountPay API client could not be loaded — is the plugin active?'));
     }
-    $result = $api->get_country_banks($country, true);
-    if (is_wp_error($result)) {
-        $base = method_exists($api, 'get_api_base_url') ? $api->get_api_base_url() : '';
-        $url  = rtrim($base, '/') . '/v1/banks/public/logos?country=' . $country;
-        $msg  = $result->get_error_message();
-        if ($msg === '') $msg = $result->get_error_code();
-        wp_send_json_error(array('message' => 'Could not load banks from ' . $url . ' — ' . $msg));
+
+    $base   = method_exists($api, 'get_api_base_url') ? $api->get_api_base_url() : '';
+    $totals = array();
+    $errors = array();
+    foreach ($countries as $cc) {
+        $cache_key = 'acountpay_banks_' . strtolower($cc);
+        delete_transient($cache_key);
+        delete_transient($cache_key . '_stale');
+
+        $result = $api->get_country_banks($cc, true);
+        if (is_wp_error($result)) {
+            $msg = $result->get_error_message();
+            if ($msg === '') $msg = $result->get_error_code();
+            $errors[$cc] = $cc . ': could not load from '
+                . rtrim($base, '/') . '/v1/banks/public/logos?country=' . $cc
+                . ' — ' . $msg;
+            continue;
+        }
+        $totals[$cc] = is_array($result) ? count($result) : 0;
     }
-    wp_send_json_success(array(
-        'message' => sprintf('%d banks loaded for %s', count($result), $country),
-    ));
+
+    if (!empty($errors) && empty($totals)) {
+        wp_send_json_error(array('message' => implode(' · ', $errors)));
+    }
+
+    $parts = array();
+    foreach ($totals as $cc => $count) {
+        $parts[] = sprintf('%d %s', $count, $cc);
+    }
+    $message = 'Loaded: ' . implode(' · ', $parts);
+    if (!empty($errors)) $message .= ' · ' . implode(' · ', $errors);
+    wp_send_json_success(array('message' => $message));
 }
 
 function acountpay_ajax_proxy_reverify_order()

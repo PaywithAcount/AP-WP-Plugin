@@ -7,6 +7,60 @@ The plugin follows [Semantic Versioning](https://semver.org/) once it leaves
 2.x. Until then, the major number tracks the AcountPay payment-link API
 generation (v2 → 2.x).
 
+## 2.1.8 — 2026-04-19
+
+### Added
+
+- **Full Token.io FI bank coverage.** Added the two missing Finnish banks
+  (`ngp-ntsb` N26 and `ob-revolut-eea` Revolut) to the bundled FI fallback so
+  the carousel renders all 13 banks Token.io exposes for Finland, even before
+  AcountBackend's matching `banks` rows have been backfilled. Also added
+  `ob-danske-fin-bus` (Danske Bank - Business) and `ob-wise-eea` (Wise) for
+  parity with the live API. No SVGs ship for the multi-country EEA banks
+  (Revolut, N26, Wise) — live CDN logo URLs are served by AcountPay's
+  `/v1/banks/public/logos` endpoint.
+
+### Notes for self-hosted AcountBackend operators
+
+- A companion DB migration (`20260420_add_finnish_revolut_n26.sql`) inserts
+  matching `('FI', 'ngp-ntsb')` and `('FI', 'ob-revolut-eea')` rows with
+  populated `logo_url`s. Run it after deploying this plugin update to make
+  these banks selectable end-to-end.
+
+## 2.1.7 — 2026-04-19
+
+### Added
+
+- **Multi-country bank selector.** *Bank country* is now a multiselect (Finland
+  + Denmark) so a Nordic store can accept both nationalities of bank login at
+  once without running two plugin installs. The default is `['FI','DK']` for
+  fresh installs; existing installs that stored the legacy single-string value
+  (`"FI"` or `"DK"`) keep working unchanged — `get_bank_countries()` coerces
+  both shapes to a sanitised list. The bank-logo carousel and the
+  `Refresh bank list` AJAX endpoint both fan out across every selected country
+  and merge the results.
+- **DK bundled fallback entries** for Danske Bank (Personal + Business),
+  Nordea, Jyske Bank, Sydbank, Spar Nord and Nykredit, so a DK-only store sees
+  a non-empty bank multiselect even before the AcountBackend `banks.logo_url`
+  rows are populated for Denmark. (Live CDN logos still come from
+  AcountPay — the bundled entries just keep the settings UI usable.)
+
+### Fixed
+
+- **Empty backend response no longer red-pills the merchant.** Hitting
+  `/v1/banks/public/logos?country=DK` against a backend whose DK rows have
+  `logo_url IS NULL` returned a perfectly valid `{country, banks: []}`
+  payload, but `get_country_banks()` treated "no rows" as "malformed" and
+  surfaced *"Bank list response was empty or malformed"* in the
+  `Refresh bank list` pill. The plugin now distinguishes
+  *malformed* (missing `banks` key entirely → still an error) from
+  *empty* (`banks: []` → success-with-zero-rows; cached for 1h instead of
+  24h so the carousel re-checks soon, and `get_supported_banks()` falls
+  back to bundled entries for that country).
+- `process_admin_options()` now compares the bank-country selection as a
+  *sorted set* so reordering alone doesn't bust the cache, and flushes the
+  union of old + new countries when the selection actually changes.
+
 ## 2.1.6 — 2026-04-19
 
 ### Fixed

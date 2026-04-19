@@ -454,8 +454,8 @@ class AcountPay_API
         $response = $this->make_request($endpoint, 'GET');
 
         if (is_wp_error($response)) {
-            // On error, return the stale cache if any so the carousel doesn't
-            // suddenly disappear when the API hiccups.
+            // On a real transport / HTTP error return the stale cache if any
+            // so the carousel doesn't suddenly disappear when the API hiccups.
             $stale = get_transient($cache_key . '_stale');
             if (is_array($stale)) {
                 return $stale;
@@ -463,14 +463,22 @@ class AcountPay_API
             return $response;
         }
 
-        if (!is_array($response) || empty($response['banks']) || !is_array($response['banks'])) {
+        // A *malformed* response (missing the `banks` key entirely, or `banks`
+        // is not an array) is a real upstream bug. Surface it.
+        if (!is_array($response) || !array_key_exists('banks', $response) || !is_array($response['banks'])) {
             $stale = get_transient($cache_key . '_stale');
             if (is_array($stale)) {
                 return $stale;
             }
-            return new WP_Error('invalid_response', 'Bank list response was empty or malformed');
+            return new WP_Error('invalid_response', 'Bank list response was malformed (missing banks array)');
         }
 
+        // An *empty* response (`banks: []`) is NOT an error — it just means the
+        // backend has no banks with logos populated for this country yet. Fall
+        // through and cache the empty result for a short window so we re-check
+        // soon (instead of locking in an empty list for 24h). The plugin's
+        // get_supported_banks() then merges with the bundled SVG fallback so
+        // checkout never renders blank.
         $clean = array();
         foreach ($response['banks'] as $b) {
             if (empty($b['bankId']) || empty($b['logoUrl'])) {
@@ -488,11 +496,12 @@ class AcountPay_API
         }
 
         if (empty($clean)) {
-            $stale = get_transient($cache_key . '_stale');
-            if (is_array($stale)) {
-                return $stale;
-            }
-            return new WP_Error('empty_result', 'No banks with logos returned');
+            // Cache the empty result for 1h so we don't hammer the backend on
+            // every checkout, but also re-check soon once data is added.
+            // Keep any pre-existing stale cache as-is so a transient backend
+            // wipe doesn't drop the carousel.
+            set_transient($cache_key, array(), HOUR_IN_SECONDS);
+            return array();
         }
 
         // Fresh cache: 24h. Long-lived stale cache: 7d (used as fallback when
