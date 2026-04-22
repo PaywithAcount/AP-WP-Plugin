@@ -167,6 +167,13 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         add_action('wp_ajax_acountpay_refresh_banks', [$this, 'ajax_refresh_banks']);
         add_action('wp_ajax_acountpay_reverify_order', [$this, 'ajax_reverify_order']);
 
+        // NOTE: the `acountpay_reverify_pending_order` Action Scheduler hook
+        // is bound at module load (see acountpay-payment.php) rather than
+        // here, because Action Scheduler workers may dispatch the job
+        // before WooCommerce has loaded the gateway list. Binding it here
+        // would also cause double-execution (constructor + module load) for
+        // any cron request that does instantiate the gateway via Woo.
+
         //is valid for use
         if (!$this->is_valid_for_use()) {
             //disable the gateway because the current currency is not supported
@@ -1652,11 +1659,124 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         }
         $order->save();
 
+        // Schedule the first backstop reverify. The webhook + bank-redirect
+        // callback are the primary status sources; this scheduled re-poll
+        // exists for the cases where both are blocked or delayed (merchant
+        // site briefly unreachable, ngrok tunnel rotation, customer never
+        // returns from the bank app, etc.).
+        $this->schedule_pending_reverify($order_id, 1);
+
         $this->log_info('process_payment: redirecting to POS', array('order_id' => $order_id, 'payment_id' => $payment_id));
         return array(
             'result'   => 'success',
             'redirect' => $redirect_to_pos,
         );
+    }
+
+    /**
+     * Action Scheduler backoff steps in seconds: 5min, 15min, 30min, 1h, 4h, 24h.
+     * After the 6th attempt the order is left alone and the merchant is
+     * expected to use the manual "Re-verify" button on the order edit screen.
+     */
+    public function get_reverify_backoff_steps()
+    {
+        return array(
+            5 * MINUTE_IN_SECONDS,
+            15 * MINUTE_IN_SECONDS,
+            30 * MINUTE_IN_SECONDS,
+            HOUR_IN_SECONDS,
+            4 * HOUR_IN_SECONDS,
+            DAY_IN_SECONDS,
+        );
+    }
+
+    /**
+     * Queue (or re-queue) a background poll of the AcountPay backend for the
+     * given order. `$attempt` is 1-based and indexes into get_reverify_backoff_steps().
+     * No-op when Action Scheduler isn't loaded (e.g. very old WooCommerce).
+     */
+    public function schedule_pending_reverify($order_id, $attempt = 1)
+    {
+        if (!function_exists('as_schedule_single_action') || !function_exists('as_unschedule_all_actions')) {
+            return;
+        }
+        $steps    = $this->get_reverify_backoff_steps();
+        $max      = count($steps);
+        $attempt  = max(1, (int) $attempt);
+        if ($attempt > $max) {
+            return; // Cap reached; merchant can manually re-verify if needed.
+        }
+        $delay = $steps[$attempt - 1];
+
+        // Ensure idempotency: a single order should never have more than one
+        // queued action for the same hook.
+        as_unschedule_all_actions('acountpay_reverify_pending_order', array((int) $order_id), 'acountpay');
+        as_schedule_single_action(
+            time() + $delay,
+            'acountpay_reverify_pending_order',
+            array((int) $order_id, $attempt),
+            'acountpay'
+        );
+    }
+
+    /**
+     * Action Scheduler handler: re-poll the backend for an order's payment
+     * status, apply it via the shared classifier, and reschedule with the
+     * next backoff step if the status is still pending. Stops as soon as a
+     * terminal bucket (paid/failed/refunded) is reached, or after the cap.
+     */
+    public function handle_scheduled_reverify($order_id, $attempt = 1)
+    {
+        $order = wc_get_order((int) $order_id);
+        if (!$order || $order->get_payment_method() !== $this->id) {
+            return;
+        }
+        // Already terminal in Woo? Don't bother polling.
+        if (in_array($order->get_status(), array('processing', 'completed', 'refunded', 'failed'), true)) {
+            return;
+        }
+        if (!isset($this->api) || !$this->api) {
+            // Try once more later — API client wasn't ready (likely a hot-
+            // reload race during plugin activation).
+            $this->schedule_pending_reverify($order_id, $attempt + 1);
+            return;
+        }
+
+        $reference = (string) $order->get_meta('_acountpay_reference_number');
+        if ($reference === '') {
+            $reference = (string) $order->get_order_number();
+        }
+        $result = $this->api->verify_payment_status($reference);
+        if (is_wp_error($result) || !is_array($result)) {
+            $this->log_warning('Scheduled reverify: backend unreachable', array(
+                'order_id' => $order_id,
+                'attempt'  => $attempt,
+                'error'    => is_wp_error($result) ? $result->get_error_message() : 'invalid response',
+            ));
+            $this->schedule_pending_reverify($order_id, $attempt + 1);
+            return;
+        }
+
+        $backend_status = isset($result['status']) ? (string) $result['status'] : '';
+        $bucket = $this->apply_backend_status_to_order($order, $backend_status);
+
+        if (in_array($bucket, array('paid', 'failed', 'refunded'), true)) {
+            $this->log_info('Scheduled reverify: terminal status reached', array(
+                'order_id' => $order_id,
+                'attempt'  => $attempt,
+                'bucket'   => $bucket,
+                'backend'  => $backend_status,
+            ));
+            return; // Terminal — no need to reschedule.
+        }
+
+        // Still pending; back off and try again.
+        $this->log_info('Scheduled reverify: still pending', array(
+            'order_id' => $order_id,
+            'attempt'  => $attempt,
+            'backend'  => $backend_status ?: 'empty',
+        ));
+        $this->schedule_pending_reverify($order_id, $attempt + 1);
     }
 
     /**
@@ -1791,10 +1911,11 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             // Treat the URL `status` as a HINT only — the source of truth is
             // the backend verification call (and the signed webhook). Bank
             // redirects can arrive with stale or even forged status values.
-            $url_status = isset($_GET['status']) ? sanitize_text_field(wp_unslash($_GET['status'])) : '';
+            $url_status = isset($_GET['status']) ? strtolower(sanitize_text_field(wp_unslash($_GET['status']))) : '';
             $this->log_info('Payment callback: verifying with backend', array('order_id' => $order_id, 'url_status' => $url_status));
 
             $backend_status = '';
+            $backend_unreachable = false;
             if (isset($this->api) && $this->api) {
                 $reference = (string) $order->get_meta('_acountpay_reference_number');
                 if ($reference === '') {
@@ -1805,34 +1926,60 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                     $backend_status = isset($verify_result['status']) ? (string) $verify_result['status'] : '';
                     $this->log_info('Payment callback: backend status', array('order_id' => $order_id, 'backend_status' => $backend_status));
                 } else {
+                    $backend_unreachable = true;
                     $this->log_warning('Payment callback: backend verification failed', array('order_id' => $order_id, 'error' => is_wp_error($verify_result) ? $verify_result->get_error_message() : 'invalid response'));
                 }
             }
 
-            $is_paid     = in_array($backend_status, array('paid', 'settled', 'completed', 'processed'), true);
-            $is_pending  = in_array($backend_status, array('pending', 'processing', 'authorized', ''), true);
-            $is_failed   = in_array($backend_status, array('failed', 'rejected', 'failure_expired'), true);
-            $is_refunded = in_array($backend_status, array('refunded', 'partially_refunded'), true);
+            $bucket = $this->classify_backend_status($backend_status);
 
-            if ($is_paid) {
+            // STRICT CANCELLATION: trust a negative URL hint (status=cancelled
+            // or status=failed coming back from the POS / bank redirect) when
+            // the backend hasn't yet caught up. Without this, an abandoned
+            // payment leaves the backend reporting `pending` (no CANCELLED
+            // status exists in the PaymentStatus enum) and the customer
+            // would otherwise be silently routed to the thank-you page —
+            // which looks like a successful order to them.
+            $is_user_cancelled = in_array($url_status, array('cancelled', 'canceled', 'failed'), true)
+                && ($bucket === 'pending' || $backend_unreachable || $backend_status === '');
+
+            if ($bucket === 'paid') {
                 wc_add_notice(__('Payment successful, thank you for your order.', ACOUNTPAY_TEXT_DOMAIN), 'success');
                 $order->add_order_note(sprintf(__('Pay by Bank: payment confirmed via callback (backend status: %s).', ACOUNTPAY_TEXT_DOMAIN), $backend_status));
-                $order->payment_complete((string) $order->get_meta('_acountpay_payment_id'));
-                $this->maybe_apply_paid_status_mapping($order);
+                $this->apply_backend_status_to_order($order, $backend_status);
+                if (function_exists('as_unschedule_all_actions')) {
+                    as_unschedule_all_actions('acountpay_reverify_pending_order', array($order_id), 'acountpay');
+                }
                 wp_safe_redirect($order->get_checkout_order_received_url());
                 exit;
             }
 
-            if ($is_refunded) {
+            if ($bucket === 'refunded') {
                 $order->add_order_note(__('Pay by Bank: backend reports payment as refunded.', ACOUNTPAY_TEXT_DOMAIN));
-                $order->update_status('refunded', __('Refunded via Pay by Bank.', ACOUNTPAY_TEXT_DOMAIN));
+                $this->apply_backend_status_to_order($order, $backend_status);
+                if (function_exists('as_unschedule_all_actions')) {
+                    as_unschedule_all_actions('acountpay_reverify_pending_order', array($order_id), 'acountpay');
+                }
                 wp_safe_redirect($order->get_checkout_order_received_url());
                 exit;
             }
 
-            if ($is_failed) {
-                $this->apply_failed_status($order, $backend_status ?: $url_status);
-                wc_add_notice(__('Payment failed or was cancelled. Please try again.', ACOUNTPAY_TEXT_DOMAIN), 'error');
+            if ($bucket === 'failed' || $is_user_cancelled) {
+                $reason = $is_user_cancelled
+                    ? ($url_status ?: 'cancelled')
+                    : ($backend_status ?: $url_status);
+                if ($is_user_cancelled) {
+                    $order->add_order_note(sprintf(
+                        __('Pay by Bank: payment cancelled by customer at the bank (URL hint: %s, backend: %s).', ACOUNTPAY_TEXT_DOMAIN),
+                        $url_status,
+                        $backend_status !== '' ? $backend_status : 'no response'
+                    ));
+                }
+                $this->apply_failed_status($order, $reason);
+                if (function_exists('as_unschedule_all_actions')) {
+                    as_unschedule_all_actions('acountpay_reverify_pending_order', array($order_id), 'acountpay');
+                }
+                wc_add_notice(__('Payment was cancelled. Please try again or pick a different payment method.', ACOUNTPAY_TEXT_DOMAIN), 'error');
                 wp_safe_redirect(wc_get_checkout_url());
                 exit;
             }
@@ -1844,6 +1991,10 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             if (!in_array($order->get_status(), array('on-hold', 'pending'), true)) {
                 $order->update_status('on-hold', __('Awaiting payment confirmation from the bank.', ACOUNTPAY_TEXT_DOMAIN));
             }
+            // Schedule a backstop reverify in case the webhook never arrives
+            // (e.g. the merchant's site was unreachable when the bank
+            // confirmed the payment hours later).
+            $this->schedule_pending_reverify($order_id, 1);
             wp_safe_redirect($order->get_checkout_order_received_url());
             exit;
         } catch (Exception $e) {
@@ -1867,6 +2018,90 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         } elseif ($mapping === 'processing' && $order->get_status() !== 'processing') {
             $order->update_status('processing', __('Forced to processing (Pay by Bank setting).', ACOUNTPAY_TEXT_DOMAIN));
         }
+    }
+
+    /**
+     * Single source of truth for translating an AcountPay backend status
+     * string into one of four buckets: paid, failed, refunded, pending.
+     *
+     * `authorized` and post-auth `processing` map to PAID because Token.io's
+     * INITIATION_COMPLETED maps to PaymentStatus.PAID for instant rails and
+     * PaymentStatus.AUTHORIZED for non-instant rails — both mean "the bank
+     * has committed to the payment" and are effectively irrevocable from the
+     * customer's side. We mark the order paid immediately so the merchant
+     * can fulfil; if a later SETTLEMENT_INCOMPLETE arrives, the backend
+     * re-fires the webhook and handle_webhook's reversal branch flips the
+     * order to failed.
+     *
+     * @param string $backend_status Raw status from /transaction-status.
+     * @return string One of: paid, failed, refunded, pending.
+     */
+    public function classify_backend_status($backend_status)
+    {
+        $s = strtolower(trim((string) $backend_status));
+        if (in_array($s, array('paid', 'settled', 'completed', 'processed', 'authorized', 'success'), true)) {
+            return 'paid';
+        }
+        if (in_array($s, array('failed', 'rejected', 'failure_expired', 'cancelled', 'canceled'), true)) {
+            return 'failed';
+        }
+        if (in_array($s, array('refunded', 'partially_refunded'), true)) {
+            return 'refunded';
+        }
+        // 'processing' alone is ambiguous (could be pre-auth or post-auth);
+        // treat as pending and let the next reverify or webhook resolve it.
+        return 'pending';
+    }
+
+    /**
+     * Apply a backend payment status to a Woo order. Used by the callback,
+     * the webhook, the manual "Re-verify" admin button and the scheduled
+     * background poller — keeping this in one place ensures all four agree
+     * on what counts as paid / failed / pending.
+     *
+     * Returns the bucket that was applied (paid/failed/refunded/pending) so
+     * callers can decide whether to reschedule a poll or stop.
+     *
+     * @param WC_Order $order
+     * @param string   $backend_status
+     * @return string
+     */
+    public function apply_backend_status_to_order($order, $backend_status)
+    {
+        $bucket         = $this->classify_backend_status($backend_status);
+        $current_status = $order->get_status();
+        $payment_id     = (string) $order->get_meta('_acountpay_payment_id');
+
+        if ($backend_status !== '') {
+            $order->update_meta_data('_acountpay_status', $backend_status);
+        }
+
+        if ($bucket === 'paid') {
+            // payment_complete() is idempotent; calling on an already-paid
+            // order is a no-op (it skips the status transition + email).
+            if (!in_array($current_status, array('processing', 'completed'), true)) {
+                $order->payment_complete($payment_id);
+            }
+            $this->maybe_apply_paid_status_mapping($order);
+        } elseif ($bucket === 'refunded') {
+            if ($order->get_status() !== 'refunded') {
+                $order->update_status('refunded', sprintf(
+                    __('Pay by Bank: backend reports %s.', ACOUNTPAY_TEXT_DOMAIN),
+                    $backend_status
+                ));
+            }
+        } elseif ($bucket === 'failed') {
+            // Allow processing -> failed on settlement reversal, but never
+            // override an admin-completed order (handle_webhook adds the
+            // reversal note before this is reached on the webhook path).
+            if ($current_status !== 'completed') {
+                $this->apply_failed_status($order, $backend_status);
+            }
+        }
+        // 'pending' bucket: no status change; the meta refresh above is enough.
+
+        $order->save();
+        return $bucket;
     }
 
     /**
@@ -2049,15 +2284,62 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             return;
         }
 
-        // Don't regress orders that are already in a final paid state.
-        if (in_array($current_status, array('completed'), true)) {
+        // Per-order eventId dedup — complements the plugin-wide transient
+        // dedup at the top of this handler. Stored on the order itself so an
+        // admin can see the last delivery from the order edit screen, and so
+        // dedup state survives transient cache flushes.
+        if ($event_id !== '') {
+            $last_event_id = (string) $order->get_meta('_acountpay_last_webhook_event_id');
+            if ($last_event_id !== '' && $last_event_id === $event_id) {
+                $order->save();
+                $this->log_info('Webhook: duplicate eventId on order, ignoring', array('order_id' => $order->get_id(), 'event_id' => $event_id));
+                wp_send_json(array('received' => true, 'duplicate' => true));
+                return;
+            }
+            $order->update_meta_data('_acountpay_last_webhook_event_id', $event_id);
+        }
+
+        // Classify the event using the same buckets as the callback handler
+        // so success/failure/refund routing is identical across both paths.
+        // We prefer the high-level `status` field and fall back to the more
+        // granular `internalStatus` (Token.io PaymentStatus enum string) so
+        // newer backend payloads (e.g. internalStatus='authorized') still
+        // map to the right bucket without touching the high-level `status`.
+        $event_bucket = $this->classify_backend_status($status);
+        if ($event_bucket === 'pending' && $internal_status !== '') {
+            $event_bucket = $this->classify_backend_status($internal_status);
+        }
+
+        $is_failure_event = ($event_bucket === 'failed');
+        $is_success_event = ($event_bucket === 'paid');
+
+        // POST-AUTHORIZATION REVERSAL: if the order is already `processing`
+        // (we treated INITIATION_COMPLETED as paid) and the bank later
+        // reports SETTLEMENT_INCOMPLETE / FAILED, the funds never actually
+        // arrived — flip the order to `failed` so the merchant doesn't ship
+        // goods on a paid-then-reversed order. Only `completed` orders are
+        // protected (an admin who manually completed the order shouldn't be
+        // silently overridden — we just leave a note).
+        if ($is_failure_event && $current_status === 'completed') {
+            $order->add_order_note(sprintf(
+                __('Pay by Bank: post-completion failure webhook ignored (status: %s). Please review manually.', ACOUNTPAY_TEXT_DOMAIN),
+                $status ?: $internal_status
+            ));
             $order->save();
-            $this->log_info('Webhook: Order already final, only meta refreshed', array('order_id' => $order->get_id(), 'current' => $current_status));
+            wp_send_json(array('received' => true, 'protected' => true));
+            return;
+        }
+
+        // For non-failure events, keep the existing protection: don't
+        // regress an already-completed order to processing/anything else.
+        if (!$is_failure_event && $current_status === 'completed') {
+            $order->save();
+            $this->log_info('Webhook: Order already completed, only meta refreshed', array('order_id' => $order->get_id(), 'current' => $current_status));
             wp_send_json(array('received' => true, 'already_final' => true));
             return;
         }
 
-        if (in_array($status, array('success', 'paid', 'settled', 'completed'), true)) {
+        if ($is_success_event) {
             $order->add_order_note(sprintf(
                 __('Pay by Bank: payment confirmed via webhook (status: %1$s, amount: %2$s %3$s).', ACOUNTPAY_TEXT_DOMAIN),
                 $status,
@@ -2068,9 +2350,17 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                 $order->payment_complete($payment_id);
             }
             $this->maybe_apply_paid_status_mapping($order);
-        } elseif (in_array($status, array('failed', 'rejected'), true) || in_array($internal_status, array('failed', 'failure_expired', 'rejected'), true)) {
-            if (!in_array($current_status, array('processing', 'completed'), true)) {
-                $this->apply_failed_status($order, $status ?: $internal_status);
+            // Webhook closed the loop — cancel any pending background polls.
+            if (function_exists('as_unschedule_all_actions')) {
+                as_unschedule_all_actions('acountpay_reverify_pending_order', array($order->get_id()), 'acountpay');
+            }
+        } elseif ($is_failure_event) {
+            if ($current_status === 'processing') {
+                $order->add_order_note(__('Pay by Bank: payment authorisation later reversed by the bank during settlement. Order moved to Failed automatically.', ACOUNTPAY_TEXT_DOMAIN));
+            }
+            $this->apply_failed_status($order, $status ?: $internal_status);
+            if (function_exists('as_unschedule_all_actions')) {
+                as_unschedule_all_actions('acountpay_reverify_pending_order', array($order->get_id()), 'acountpay');
             }
         } else {
             $order->add_order_note(sprintf(
@@ -2249,16 +2539,19 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             wp_send_json_error(array('message' => __('Unexpected response from AcountPay.', ACOUNTPAY_TEXT_DOMAIN)));
         }
         $backend_status = isset($result['status']) ? (string) $result['status'] : '';
-        $order->update_meta_data('_acountpay_status', $backend_status);
-        if (in_array($backend_status, array('paid', 'settled', 'completed', 'processed'), true) && !in_array($order->get_status(), array('processing', 'completed'), true)) {
-            $order->payment_complete((string) $order->get_meta('_acountpay_payment_id'));
-            $this->maybe_apply_paid_status_mapping($order);
-        } elseif (in_array($backend_status, array('refunded', 'partially_refunded'), true) && $order->get_status() !== 'refunded') {
-            $order->update_status('refunded', __('Pay by Bank: backend reports refunded (manual re-verify).', ACOUNTPAY_TEXT_DOMAIN));
-        } elseif (in_array($backend_status, array('failed', 'rejected', 'failure_expired'), true) && !in_array($order->get_status(), array('processing', 'completed'), true)) {
-            $this->apply_failed_status($order, $backend_status);
+        // Delegate to the shared classifier so manual re-verify, the bank
+        // redirect callback and the background poller all converge on the
+        // same outcome for a given backend status.
+        $this->apply_backend_status_to_order($order, $backend_status);
+
+        // Cancel any pending background reverifies once the manual re-verify
+        // produced a terminal status — saves the merchant from seeing the
+        // same change twice in the order notes.
+        $bucket = $this->classify_backend_status($backend_status);
+        if (in_array($bucket, array('paid', 'failed', 'refunded'), true) && function_exists('as_unschedule_all_actions')) {
+            as_unschedule_all_actions('acountpay_reverify_pending_order', array($order_id), 'acountpay');
         }
-        $order->save();
+
         wp_send_json_success(array('message' => sprintf(__('Status: %s', ACOUNTPAY_TEXT_DOMAIN), $backend_status ?: 'unknown')));
     }
 

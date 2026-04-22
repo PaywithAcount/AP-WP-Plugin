@@ -6,7 +6,7 @@
  * Author:      AcountPay
  * Author URI:  https://acountpay.com
  * Description: Pay by Bank for WooCommerce, powered by AcountPay. Lets shoppers pay directly from their bank account via PSD2 / open banking, with a configurable bank-logo carousel, classic + block checkout support, signed callbacks, signed server-to-server webhooks, an order-edit panel showing payment id and PSU lookup state, and a manual-refund flow driven from the AcountPay Merchant Dashboard.
- * Version:     2.1.9
+ * Version:     2.1.10
  * Requires at least: 5.8
  * Tested up to: 6.9.1
  * Requires PHP: 7.4
@@ -23,7 +23,7 @@ if (!defined('ABSPATH')) {
 }
 
 //define the plugin constants
-define('ACOUNTPAY_PAYMENT_VERSION', '2.1.9');
+define('ACOUNTPAY_PAYMENT_VERSION', '2.1.10');
 define('ACOUNTPAY_PAYMENT_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('ACOUNTPAY_PAYMENT_PLUGIN_PATH', plugin_dir_path(__FILE__));
 define('ACOUNTPAY_TEXT_DOMAIN', 'acountpay-payment');
@@ -68,6 +68,11 @@ if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get
     add_action('wp_ajax_acountpay_test_connection', 'acountpay_ajax_proxy_test_connection');
     add_action('wp_ajax_acountpay_refresh_banks', 'acountpay_ajax_proxy_refresh_banks');
     add_action('wp_ajax_acountpay_reverify_order', 'acountpay_ajax_proxy_reverify_order');
+
+    // Action Scheduler background re-verify. Registered at module load so
+    // Action Scheduler's WP-Cron / async worker finds a handler even when
+    // WooCommerce hasn't loaded the gateway list during the worker request.
+    add_action('acountpay_reverify_pending_order', 'acountpay_action_scheduler_proxy_reverify', 10, 2);
 }
 
 /**
@@ -238,6 +243,30 @@ function acountpay_ajax_proxy_reverify_order()
         wp_send_json_error(array('message' => 'AcountPay gateway could not be loaded. Please reactivate the plugin.'));
     }
     $gw->ajax_reverify_order();
+}
+
+/**
+ * Action Scheduler dispatcher for the background re-verify poll. The
+ * gateway already binds the same hook from its constructor; this top-level
+ * wrapper guarantees the worker can dispatch even when the gateway isn't
+ * otherwise instantiated for the cron request (mirrors the AJAX proxies
+ * above).
+ */
+function acountpay_action_scheduler_proxy_reverify($order_id, $attempt = 1)
+{
+    $gw = acountpay_resolve_gateway();
+    if (!$gw || !method_exists($gw, 'handle_scheduled_reverify')) {
+        return;
+    }
+    // The gateway-bound handler is also registered, so guard against running
+    // it twice in the same request.
+    static $seen = array();
+    $key = (int) $order_id . '-' . (int) $attempt;
+    if (isset($seen[$key])) {
+        return;
+    }
+    $seen[$key] = true;
+    $gw->handle_scheduled_reverify($order_id, $attempt);
 }
 
 /**
