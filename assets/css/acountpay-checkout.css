@@ -10,7 +10,6 @@
     border-radius: 8px;
     background: #ffffff;
     transition: all 0.3s ease;
-    overflow: hidden;
 }
 
 .wc_payment_method.payment_method_acountpay_payment:hover {
@@ -183,6 +182,8 @@
     display: inline-flex;
     align-items: center;
     margin-left: 0.25rem;
+    z-index: 9999;
+    isolation: isolate;
 }
 .acountpay-info-bubble {
     width: 18px;
@@ -225,7 +226,7 @@
     visibility: hidden;
     pointer-events: none;
     transition: opacity .15s ease, visibility .15s ease;
-    z-index: 20;
+    z-index: 1;
     text-align: left;
 }
 .acountpay-info-popover strong {
