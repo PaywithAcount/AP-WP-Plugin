@@ -6,7 +6,7 @@
  * Author:      AcountPay
  * Author URI:  https://acountpay.com
  * Description: Pay by Bank for WooCommerce, powered by AcountPay. Lets shoppers pay directly from their bank account via PSD2 / open banking, with a configurable bank-logo carousel, classic + block checkout support, signed callbacks, signed server-to-server webhooks, an order-edit panel showing payment id and PSU lookup state, and a manual-refund flow driven from the AcountPay Merchant Dashboard.
- * Version:     2.1.10
+ * Version:     2.1.11
  * Requires at least: 5.8
  * Tested up to: 6.9.1
  * Requires PHP: 7.4
@@ -23,7 +23,7 @@ if (!defined('ABSPATH')) {
 }
 
 //define the plugin constants
-define('ACOUNTPAY_PAYMENT_VERSION', '2.1.10');
+define('ACOUNTPAY_PAYMENT_VERSION', '2.1.11');
 define('ACOUNTPAY_PAYMENT_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('ACOUNTPAY_PAYMENT_PLUGIN_PATH', plugin_dir_path(__FILE__));
 define('ACOUNTPAY_TEXT_DOMAIN', 'acountpay-payment');

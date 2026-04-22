@@ -303,6 +303,47 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
     }
 
     /**
+     * Pick ONE country code to send to the AcountPay POS for this specific
+     * payment. The POS bank selector is single-country (one flat list, or
+     * the DK-specific Personal/Business tabs); when the merchant has
+     * configured multiple countries in `bank_country` we pick the one that
+     * best matches the order currency, since Danish banks don't process EUR
+     * SEPA payments and Finnish banks don't process DKK.
+     *
+     * Resolution order:
+     *   1. Currency mapping (EUR -> FI, DKK -> DK, SEK -> SE, etc.) when the
+     *      mapped country is in the merchant's configured list.
+     *   2. The first configured country.
+     *   3. 'DK' (preserves legacy default for stores upgrading from <2.1.10).
+     *
+     * @param string $currency ISO-4217 currency for this order.
+     * @return string ISO-3166-1 alpha-2 country code.
+     */
+    public function pick_pos_country_for_order($currency = '')
+    {
+        $configured = $this->get_bank_countries();
+        $currency   = strtoupper((string) $currency);
+
+        $currency_to_country = array(
+            'EUR' => 'FI',
+            'DKK' => 'DK',
+            'SEK' => 'SE',
+            'NOK' => 'NO',
+        );
+        if (isset($currency_to_country[$currency])) {
+            $candidate = $currency_to_country[$currency];
+            if (in_array($candidate, $configured, true)) {
+                return $candidate;
+            }
+        }
+
+        if (!empty($configured)) {
+            return $configured[0];
+        }
+        return 'DK';
+    }
+
+    /**
      * Build the full options map (bankId => display name) for the merchant's
      * configured countries. Live AcountPay data is preferred — bundled fallback
      * fills the gaps so the settings screen and carousel keep working offline,
@@ -1354,14 +1395,15 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         $webhook_url  = add_query_arg('order_id', $order_id, WC()->api_request_url('acountpay_webhook'));
 
         $payment_data = array(
-            'clientId'        => $client_id,
-            'amount'          => $amount,
-            'referenceNumber' => $reference_number,
-            'redirectUrl'     => $callback_url,
-            'webhookUrl'      => $webhook_url,
-            'description'     => sprintf(__('Payment for order #%s', ACOUNTPAY_TEXT_DOMAIN), $order->get_order_number()),
-            'currency'        => $currency,
-            'idempotencyKey'  => $idempotency_key,
+            'clientId'           => $client_id,
+            'amount'             => $amount,
+            'referenceNumber'    => $reference_number,
+            'redirectUrl'        => $callback_url,
+            'webhookUrl'         => $webhook_url,
+            'description'        => sprintf(__('Payment for order #%s', ACOUNTPAY_TEXT_DOMAIN), $order->get_order_number()),
+            'currency'           => $currency,
+            'idempotencyKey'     => $idempotency_key,
+            'posBankCountryCode' => $this->pick_pos_country_for_order($currency),
         );
 
         $this->log_info('receipt_page: Creating v2 payment link for retry', array('order_id' => $order_id));
@@ -1599,15 +1641,22 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         $callback_url     = $this->build_signed_callback_url($order_id, $reference_number);
         $webhook_url      = add_query_arg('order_id', $order_id, WC()->api_request_url('acountpay_webhook'));
 
+        // Per-payment POS country override. Without this the backend falls
+        // back to merchant.posBankCountryCode (a per-merchant DB column that
+        // defaults to 'DK'), so a Finnish-EUR store would always see Danish
+        // banks on the POS even though the plugin is configured for FI.
+        $pos_country = $this->pick_pos_country_for_order($currency);
+
         $payment_data = array(
-            'clientId'        => $client_id,
-            'amount'          => $amount,
-            'referenceNumber' => $reference_number,
-            'redirectUrl'     => $callback_url,
-            'webhookUrl'      => $webhook_url,
-            'description'     => $description,
-            'currency'        => $currency,
-            'idempotencyKey'  => $idempotency_key,
+            'clientId'           => $client_id,
+            'amount'             => $amount,
+            'referenceNumber'    => $reference_number,
+            'redirectUrl'        => $callback_url,
+            'webhookUrl'         => $webhook_url,
+            'description'        => $description,
+            'currency'           => $currency,
+            'idempotencyKey'     => $idempotency_key,
+            'posBankCountryCode' => $pos_country,
         );
 
         $response = $this->api->create_payment_link_v2($payment_data);

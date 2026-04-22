@@ -392,6 +392,9 @@ class AcountPay_API
         if (!empty($data['webhookUrl'])) {
             $body['webhookUrl'] = $data['webhookUrl'];
         }
+        if (!empty($data['posBankCountryCode'])) {
+            $body['posBankCountryCode'] = strtoupper(substr((string) $data['posBankCountryCode'], 0, 2));
+        }
 
         $headers = array();
         if (!empty($data['idempotencyKey'])) {
