@@ -6,7 +6,7 @@
  * Author:      AcountPay
  * Author URI:  https://acountpay.com
  * Description: Pay by Bank for WooCommerce, powered by AcountPay. Lets shoppers pay directly from their bank account via PSD2 / open banking, with a configurable bank-logo carousel, classic + block checkout support, signed callbacks, signed server-to-server webhooks, an order-edit panel showing payment id and PSU lookup state, and a manual-refund flow driven from the AcountPay Merchant Dashboard.
- * Version:     2.1.22
+ * Version:     2.1.23
  * Requires at least: 5.8
  * Tested up to: 6.9.1
  * Requires PHP: 7.4
@@ -23,12 +23,74 @@ if (!defined('ABSPATH')) {
 }
 
 //define the plugin constants
-define('ACOUNTPAY_PAYMENT_VERSION', '2.1.22');
+define('ACOUNTPAY_PAYMENT_VERSION', '2.1.23');
 define('ACOUNTPAY_PAYMENT_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('ACOUNTPAY_PAYMENT_PLUGIN_PATH', plugin_dir_path(__FILE__));
 define('ACOUNTPAY_TEXT_DOMAIN', 'acountpay-payment');
 //acountpay file
 define('ACOUNTPAY_PAYMENT_FILE', __FILE__);
+
+/**
+ * Strip legacy carousel HTML from order note bodies / comments (Payment using …).
+ * Markers are unique to this gateway — safe to collapse when present.
+ *
+ * @param string $text Raw note content.
+ * @return string
+ */
+function acountpay_strip_legacy_acountpay_note_html($text)
+{
+    if (!is_string($text) || $text === '') {
+        return is_string($text) ? $text : '';
+    }
+    if (strpos($text, 'acountpay-bank-carousel') === false && strpos($text, 'acountpay-payment-label') === false) {
+        return $text;
+    }
+    $clean = preg_replace('/\s+/', ' ', trim(wp_strip_all_tags($text)));
+
+    return is_string($clean) && $clean !== '' ? $clean : $text;
+}
+
+/** @param array       $note_fields */
+function acountpay_filter_wc_get_order_note_strip_html($note_fields, $comment)
+{
+    if (!is_array($note_fields) || !isset($note_fields['content'])) {
+        return $note_fields;
+    }
+    $note_fields['content'] = acountpay_strip_legacy_acountpay_note_html((string) $note_fields['content']);
+
+    return $note_fields;
+}
+
+/** WC REST order notes (wc-admin / HPOS UI) bypass wc_get_order_note() — sanitize here. */
+function acountpay_filter_rest_prepare_order_note_strip_html($response, $note, $request)
+{
+    if (!is_a($response, 'WP_REST_Response')) {
+        return $response;
+    }
+    $data = $response->get_data();
+    if (isset($data['note']) && is_string($data['note'])) {
+        $data['note'] = acountpay_strip_legacy_acountpay_note_html($data['note']);
+        $response->set_data($data);
+    }
+
+    return $response;
+}
+
+function acountpay_filter_comment_text_strip_acountpay_note_html($text, $comment = null)
+{
+    return acountpay_strip_legacy_acountpay_note_html($text);
+}
+
+/**
+ * Register early and at file scope so notes are cleaned even when the payment
+ * gateway class is not instantiated (REST + wc-admin).
+ */
+function acountpay_register_order_note_html_filters()
+{
+    add_filter('woocommerce_get_order_note', 'acountpay_filter_wc_get_order_note_strip_html', 10, 2);
+    add_filter('woocommerce_rest_prepare_order_note', 'acountpay_filter_rest_prepare_order_note_strip_html', 10, 3);
+    add_filter('comment_text', 'acountpay_filter_comment_text_strip_acountpay_note_html', 999, 2);
+}
 
 //check if WooCommerce is active
 if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get_option('active_plugins')))) {
@@ -44,6 +106,8 @@ if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get
             }
         }
     );
+    // Order-note HTML stripping — must not depend on gateway bootstrap (REST/wc-admin).
+    add_action('plugins_loaded', 'acountpay_register_order_note_html_filters', 5);
     //add action plugins loaded
     add_action('plugins_loaded', 'acountpay_payment_init');
     //bust the cached bank list whenever the plugin version bumps so merchants
@@ -452,7 +516,7 @@ function acountpay_payment_scrub_legacy_order_notes_html()
         if ($content === '') {
             continue;
         }
-        $clean = preg_replace('/\s+/', ' ', trim(wp_strip_all_tags($content)));
+        $clean = acountpay_strip_legacy_acountpay_note_html($content);
         if ($clean !== '' && $clean !== $content) {
             $wpdb->update(
                 $wpdb->comments,
