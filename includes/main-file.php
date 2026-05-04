@@ -155,6 +155,9 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         // so legacy rows (HTML carousel baked in before v2.1.12) never
         // surface bank logos outside checkout.
         add_filter('woocommerce_order_get_payment_method_title', [$this, 'filter_order_payment_method_title'], 10, 2);
+        // Order notes can contain immutable HTML from legacy `_payment_method_title`;
+        // Finnish HPOS screens may not hit `maybe_scrub_legacy_carousel_from_order`.
+        add_filter('comment_text', [$this, 'filter_order_note_display_strip_acountpay_html'], 999, 2);
         //admin notice when the site URL is not publicly reachable (local/docker testing)
         add_action('admin_notices', [$this, 'maybe_render_unreachable_host_notice']);
         //admin notice when the gateway is enabled but the webhook signing secret is blank
@@ -784,14 +787,54 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
     }
 
     /**
+     * Strip carousel markup from stored order notes when they are rendered (admin,
+     * emails that pass through comment_text, etc.) — complements meta scrub on save.
+     *
+     * @param string          $text    Note HTML/text.
+     * @param int|\WP_Comment $comment Comment object or id (WC varies).
+     * @return string
+     */
+    public function filter_order_note_display_strip_acountpay_html($text, $comment = null)
+    {
+        if (!is_string($text) || $text === '') {
+            return is_string($text) ? $text : '';
+        }
+        if (strpos($text, 'acountpay-bank-carousel') === false && strpos($text, 'acountpay-payment-label') === false) {
+            return $text;
+        }
+        // Only touch WooCommerce order notes — avoids affecting normal comments if a plugin echoes markup.
+        if ($comment instanceof \WP_Comment) {
+            $ctype = isset($comment->comment_type) ? (string) $comment->comment_type : '';
+            if ($ctype !== '' && $ctype !== 'order_note') {
+                return $text;
+            }
+            $pid = isset($comment->comment_post_ID) ? (int) $comment->comment_post_ID : 0;
+            if ($pid > 0) {
+                $pt = get_post_type($pid);
+                if ($pt !== false && $pt !== 'shop_order') {
+                    return $text;
+                }
+            }
+        }
+
+        return preg_replace('/\s+/', ' ', trim(wp_strip_all_tags($text)));
+    }
+
+    /**
      * Permanently remove carousel HTML from `_payment_method_title` and from
      * order notes that WooCommerce created while meta still held markup.
      * Runs once per order load in admin (guarded) so existing shops self-heal.
      */
-    public function maybe_scrub_legacy_carousel_from_order($order)
+    public function maybe_scrub_legacy_carousel_from_order($order = null)
     {
+        if ($order === null || $order === '') {
+            return;
+        }
         if (!is_admin() || !current_user_can('edit_shop_orders')) {
             return;
+        }
+        if (is_numeric($order)) {
+            $order = wc_get_order((int) $order);
         }
         if (!$order instanceof WC_Order || $order->get_payment_method() !== $this->id) {
             return;
