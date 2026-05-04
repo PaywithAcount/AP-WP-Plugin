@@ -6,7 +6,7 @@
  * Author:      AcountPay
  * Author URI:  https://acountpay.com
  * Description: Pay by Bank for WooCommerce, powered by AcountPay. Lets shoppers pay directly from their bank account via PSD2 / open banking, with a configurable bank-logo carousel, classic + block checkout support, signed callbacks, signed server-to-server webhooks, an order-edit panel showing payment id and PSU lookup state, and a manual-refund flow driven from the AcountPay Merchant Dashboard.
- * Version:     2.1.17
+ * Version:     2.1.19
  * Requires at least: 5.8
  * Tested up to: 6.9.1
  * Requires PHP: 7.4
@@ -23,7 +23,7 @@ if (!defined('ABSPATH')) {
 }
 
 //define the plugin constants
-define('ACOUNTPAY_PAYMENT_VERSION', '2.1.17');
+define('ACOUNTPAY_PAYMENT_VERSION', '2.1.19');
 define('ACOUNTPAY_PAYMENT_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('ACOUNTPAY_PAYMENT_PLUGIN_PATH', plugin_dir_path(__FILE__));
 define('ACOUNTPAY_TEXT_DOMAIN', 'acountpay-payment');
@@ -345,6 +345,7 @@ function acountpay_payment_maybe_flush_bank_cache()
     }
     acountpay_payment_scrub_legacy_html_settings();
     acountpay_payment_scrub_legacy_html_orders();
+    acountpay_payment_scrub_legacy_order_notes_html();
     update_option('acountpay_payment_version', ACOUNTPAY_PAYMENT_VERSION, false);
 }
 
@@ -424,6 +425,42 @@ function acountpay_payment_scrub_legacy_html_orders()
         }
         if (count($orders) < $per_page) {
             return;
+        }
+    }
+}
+
+/**
+ * Strip carousel markup out of WooCommerce order notes (wp_comments) left over
+ * from when `_payment_method_title` contained HTML — those strings were copied
+ * into customer-facing "Payment using …" notes verbatim.
+ */
+function acountpay_payment_scrub_legacy_order_notes_html()
+{
+    global $wpdb;
+    if (!$wpdb || !isset($wpdb->comments)) {
+        return;
+    }
+    $ids = $wpdb->get_col(
+        "SELECT comment_ID FROM {$wpdb->comments} WHERE comment_type = 'order_note' AND (comment_content LIKE '%acountpay-bank-carousel%' OR comment_content LIKE '%acountpay-payment-label%') LIMIT 5000"
+    );
+    foreach ($ids as $cid) {
+        $cid = (int) $cid;
+        if ($cid <= 0) {
+            continue;
+        }
+        $content = (string) $wpdb->get_var($wpdb->prepare("SELECT comment_content FROM {$wpdb->comments} WHERE comment_ID = %d", $cid));
+        if ($content === '') {
+            continue;
+        }
+        $clean = preg_replace('/\s+/', ' ', trim(wp_strip_all_tags($content)));
+        if ($clean !== '' && $clean !== $content) {
+            $wpdb->update(
+                $wpdb->comments,
+                array('comment_content' => $clean),
+                array('comment_ID' => $cid),
+                array('%s'),
+                array('%d')
+            );
         }
     }
 }

@@ -163,6 +163,9 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         // Order edit screen meta box (HPOS-aware): show payment id, status,
         // refunded amount, last webhook timestamp + a re-verify button.
         add_action('add_meta_boxes', [$this, 'register_order_meta_box']);
+        // Legacy HTML carousel was baked into `_payment_method_title` and into
+        // immutable Woo order notes at checkout — scrub once when staff opens the order.
+        add_action('woocommerce_admin_order_data_after_order_details', [$this, 'maybe_scrub_legacy_carousel_from_order'], 5);
 
         // Order list column with a small "AP" status pill (both legacy and HPOS).
         add_filter('manage_edit-shop_order_columns', [$this, 'register_order_list_column']);
@@ -568,8 +571,13 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
      *   2. The backend (`payment-rails.config.ts`) further sanitizes per-bank
      *      and truncates to each bank's `maxRemittancePrimaryLen` (typically
      *      25–40 chars). We pre-truncate to the merchant-configured cap
-     *      (default 18) so a long template doesn't get silently cut by
+     *      (default 25) so a long template doesn't get silently cut by
      *      the bank into something nonsensical.
+     *
+     * Truncation keeps the **last** max_len characters (not the first), so the
+     * `{order_number}` tail survives when `site_title` + `#` consume most of the
+     * budget — otherwise many distinct orders could collapse to the same string
+     * (e.g. "Nattelyst #FNA1052") when leading truncation ate the final digits.
      *
      * Placeholders supported:
      *   {order_number}   → WC_Order::get_order_number() (respects Woo Sequential)
@@ -618,7 +626,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         $rendered = preg_replace('/\s+/', ' ', (string) $rendered);
         $rendered = trim((string) $rendered);
 
-        $max_len  = (int) $this->get_option('payment_reference_max_length', 18);
+        $max_len  = (int) $this->get_option('payment_reference_max_length', 25);
         if ($max_len < 6) {
             $max_len = 6;
         } elseif ($max_len > 35) {
@@ -626,10 +634,19 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             // backend doesn't have to.
             $max_len = 35;
         }
-        if (function_exists('mb_substr')) {
-            $rendered = mb_substr($rendered, 0, $max_len, 'UTF-8');
+        // Keep the **suffix**: `{order_number}` is usually at the end; leading
+        // truncation made different orders share one reference (e.g. many
+        // "Nattelyst #FNA1052" for FNA10520–FNA10529 when max_len was 18).
+        if (function_exists('mb_strlen') && function_exists('mb_substr')) {
+            $rlen = mb_strlen($rendered, 'UTF-8');
+            if ($rlen > $max_len) {
+                $rendered = mb_substr($rendered, $rlen - $max_len, $max_len, 'UTF-8');
+            }
         } else {
-            $rendered = substr($rendered, 0, $max_len);
+            $rlen = strlen($rendered);
+            if ($rlen > $max_len) {
+                $rendered = substr($rendered, $rlen - $max_len);
+            }
         }
         $rendered = trim($rendered);
 
@@ -659,11 +676,18 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         if (!$order instanceof WC_Order) {
             return new WP_Error('acountpay_no_order', __('Invalid order.', ACOUNTPAY_TEXT_DOMAIN));
         }
-        $reference = (string) $order->get_meta('_acountpay_reference_number');
+        $reference = trim(wp_strip_all_tags((string) $order->get_meta('_acountpay_reference_number')));
+        $reference = ltrim($reference, "# \t\n\r\0\x0B");
         if ($reference === '') {
-            $reference = (string) $order->get_order_number();
+            $reference = trim(wp_strip_all_tags((string) $order->get_order_number()));
+            $reference = ltrim($reference, '#');
         }
-        $payment_id = preg_replace('/\D/', '', (string) $order->get_meta('_acountpay_payment_id'));
+        // Strip tags first — corrupted meta can concatenate digits from logo URLs into a bogus id.
+        $pid_raw = wp_strip_all_tags((string) $order->get_meta('_acountpay_payment_id'));
+        $payment_id = preg_replace('/\D/', '', $pid_raw);
+        if ($payment_id !== '' && strlen($payment_id) > 12) {
+            $payment_id = '';
+        }
 
         return $this->api->verify_payment_status($reference, $payment_id);
     }
@@ -757,6 +781,69 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             return $title;
         }
         return $this->get_stored_payment_method_title();
+    }
+
+    /**
+     * Permanently remove carousel HTML from `_payment_method_title` and from
+     * order notes that WooCommerce created while meta still held markup.
+     * Runs once per order load in admin (guarded) so existing shops self-heal.
+     */
+    public function maybe_scrub_legacy_carousel_from_order($order)
+    {
+        if (!is_admin() || !current_user_can('edit_shop_orders')) {
+            return;
+        }
+        if (!$order instanceof WC_Order || $order->get_payment_method() !== $this->id) {
+            return;
+        }
+        static $scrubbed_ids = array();
+        $oid = $order->get_id();
+        if (isset($scrubbed_ids[$oid])) {
+            return;
+        }
+        $scrubbed_ids[$oid] = true;
+
+        $changed = false;
+        $data    = $order->get_data();
+        $stored  = isset($data['payment_method_title']) ? (string) $data['payment_method_title'] : '';
+        if ($stored !== '' && (strpos($stored, '<') !== false || strpos($stored, 'acountpay-bank-carousel') !== false)) {
+            $order->set_payment_method_title($this->get_stored_payment_method_title());
+            $changed = true;
+        }
+
+        $notes = wc_get_order_notes(array('order_id' => $oid));
+        foreach ($notes as $note) {
+            $content = '';
+            if (is_object($note)) {
+                $content = isset($note->content) ? (string) $note->content : '';
+            }
+            if ($content === '' || (strpos($content, 'acountpay-bank-carousel') === false && strpos($content, 'acountpay-payment-label') === false && strpos($content, '<span') === false)) {
+                continue;
+            }
+            $nid = 0;
+            if (is_object($note)) {
+                if (method_exists($note, 'get_id')) {
+                    $nid = (int) $note->get_id();
+                } elseif (isset($note->id)) {
+                    $nid = (int) $note->id;
+                }
+            }
+            if ($nid <= 0) {
+                continue;
+            }
+            $clean = preg_replace('/\s+/', ' ', trim(wp_strip_all_tags($content)));
+            if ($clean !== '' && $clean !== $content) {
+                wp_update_comment(array(
+                    'comment_ID'      => $nid,
+                    'comment_content' => $clean,
+                ));
+                $changed = true;
+            }
+        }
+
+        if ($changed) {
+            $order->save();
+        }
     }
 
     /**
@@ -1014,8 +1101,8 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             'payment_reference_max_length' => [
                 'title'       => __('Payment reference max length', ACOUNTPAY_TEXT_DOMAIN),
                 'type'        => 'number',
-                'description' => __('Banks enforce per-rail character limits on the remittance text. The plugin truncates the rendered reference to this many characters before sending it to AcountPay. Recommended values: 18 (safe across all supported FI/DK banks), 25 (Danske Bank cap, OBIE rails), 35 (Aktia / OP / S-Pankki / Ålandsbanken / Wise), 40 (Nordea Denmark / Nordea Finland Business). Anything above 35 will be truncated by most banks. Note: Oma / POP / Säästöpankki strip non-digits from the structured reference, but the remittance text remains visible to the PSU.', ACOUNTPAY_TEXT_DOMAIN),
-                'default'     => '18',
+                'description' => __('Banks enforce per-rail character limits on the remittance text. The plugin truncates the rendered reference to this many characters before sending it to AcountPay (keeping the end of the string so the order number is not cut off when possible). Recommended values: 18–25 (short site names / legacy caps), 25 (Danske Bank cap, OBIE rails), 35 (Aktia / OP / S-Pankki / Ålandsbanken / Wise). Values above 35 are clamped. Note: Oma / POP / Säästöpankki strip non-digits from the structured reference, but the remittance text remains visible to the PSU.', ACOUNTPAY_TEXT_DOMAIN),
+                'default'     => '25',
                 'custom_attributes' => array(
                     'min'  => '6',
                     'max'  => '35',
