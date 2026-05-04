@@ -155,8 +155,10 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         // so legacy rows (HTML carousel baked in before v2.1.12) never
         // surface bank logos outside checkout.
         add_filter('woocommerce_order_get_payment_method_title', [$this, 'filter_order_payment_method_title'], 10, 2);
-        // Order notes can contain immutable HTML from legacy `_payment_method_title`;
-        // Finnish HPOS screens may not hit `maybe_scrub_legacy_carousel_from_order`.
+        // Order notes can contain immutable HTML from legacy `_payment_method_title`.
+        // Admin "Order notes" / REST use `wc_get_order_note` → `woocommerce_get_order_note`
+        // and do NOT run `comment_text`, so we filter both.
+        add_filter('woocommerce_get_order_note', [$this, 'filter_woocommerce_get_order_note_strip_acountpay_html'], 10, 2);
         add_filter('comment_text', [$this, 'filter_order_note_display_strip_acountpay_html'], 999, 2);
         //admin notice when the site URL is not publicly reachable (local/docker testing)
         add_action('admin_notices', [$this, 'maybe_render_unreachable_host_notice']);
@@ -787,14 +789,42 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
     }
 
     /**
-     * Strip carousel markup from stored order notes when they are rendered (admin,
-     * emails that pass through comment_text, etc.) — complements meta scrub on save.
+     * WooCommerce passes order note rows through `woocommerce_get_order_note` (WC ≥ 3.2)
+     * before the admin order screen / REST render them — not through `comment_text`.
+     *
+     * @param array       $note_fields Keys: content, id, order_id, …
+     * @param \WP_Comment $comment     Raw comment row.
+     * @return array
+     */
+    public function filter_woocommerce_get_order_note_strip_acountpay_html($note_fields, $comment)
+    {
+        if (!is_array($note_fields) || !isset($note_fields['content'])) {
+            return $note_fields;
+        }
+        $note_fields['content'] = $this->strip_legacy_acountpay_rich_html_from_order_note_text((string) $note_fields['content']);
+        return $note_fields;
+    }
+
+    /**
+     * Strip carousel markup from contexts that still use `comment_text` (some emails, etc.).
      *
      * @param string          $text    Note HTML/text.
-     * @param int|\WP_Comment $comment Comment object or id (WC varies).
+     * @param int|\WP_Comment $comment Unused; markers are AcountPay-specific.
      * @return string
      */
     public function filter_order_note_display_strip_acountpay_html($text, $comment = null)
+    {
+        return $this->strip_legacy_acountpay_rich_html_from_order_note_text($text);
+    }
+
+    /**
+     * Legacy builds stored `get_title()` HTML inside order notes ("Payment using …").
+     * Those strings are unique to this gateway — safe to collapse to plain text when markers match.
+     *
+     * @param string $text Note body.
+     * @return string
+     */
+    protected function strip_legacy_acountpay_rich_html_from_order_note_text($text)
     {
         if (!is_string($text) || $text === '') {
             return is_string($text) ? $text : '';
@@ -802,22 +832,8 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         if (strpos($text, 'acountpay-bank-carousel') === false && strpos($text, 'acountpay-payment-label') === false) {
             return $text;
         }
-        // Only touch WooCommerce order notes — avoids affecting normal comments if a plugin echoes markup.
-        if ($comment instanceof \WP_Comment) {
-            $ctype = isset($comment->comment_type) ? (string) $comment->comment_type : '';
-            if ($ctype !== '' && $ctype !== 'order_note') {
-                return $text;
-            }
-            $pid = isset($comment->comment_post_ID) ? (int) $comment->comment_post_ID : 0;
-            if ($pid > 0) {
-                $pt = get_post_type($pid);
-                if ($pt !== false && $pt !== 'shop_order') {
-                    return $text;
-                }
-            }
-        }
-
-        return preg_replace('/\s+/', ' ', trim(wp_strip_all_tags($text)));
+        $clean = preg_replace('/\s+/', ' ', trim(wp_strip_all_tags($text)));
+        return is_string($clean) && $clean !== '' ? $clean : $text;
     }
 
     /**
@@ -874,7 +890,11 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             if ($nid <= 0) {
                 continue;
             }
-            $clean = preg_replace('/\s+/', ' ', trim(wp_strip_all_tags($content)));
+            $clean = $this->strip_legacy_acountpay_rich_html_from_order_note_text($content);
+            if ($clean === $content && strpos($content, '<') !== false) {
+                $t2 = preg_replace('/\s+/', ' ', trim(wp_strip_all_tags($content)));
+                $clean = is_string($t2) ? $t2 : $clean;
+            }
             if ($clean !== '' && $clean !== $content) {
                 wp_update_comment(array(
                     'comment_ID'      => $nid,
