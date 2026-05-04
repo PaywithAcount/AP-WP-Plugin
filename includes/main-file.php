@@ -75,8 +75,9 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         $this->method_title = __('Pay by Bank', ACOUNTPAY_TEXT_DOMAIN);
         //description
         $this->method_description = __('Let your customers pay directly from their bank account via Pay by Bank (powered by AcountPay).', ACOUNTPAY_TEXT_DOMAIN);
-        // We render our own logo carousel inside get_title(); leaving $this->icon empty
-        // prevents WooCommerce from also rendering the legacy single-icon next to our label.
+        // Rich markup (carousel + info bubble) is injected only via
+        // `woocommerce_gateway_title` on checkout — $this->title stays plain text.
+        // $this->icon empty prevents Woo from rendering a duplicate icon beside the label.
         $this->icon = '';
         //supports
         $this->supports = array(
@@ -97,7 +98,10 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         $this->init_form_fields();
 
         ///// Form Fields //////////////////
-        $this->title = $this->get_option('title');
+        $this->title = wp_strip_all_tags((string) $this->get_option('title', __('Pay by Bank', ACOUNTPAY_TEXT_DOMAIN)));
+        if ($this->title === '') {
+            $this->title = __('Pay by Bank', ACOUNTPAY_TEXT_DOMAIN);
+        }
         $this->description = $this->get_option('description');
         $this->enabled = $this->get_option('enabled');
 
@@ -132,6 +136,8 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         add_action('admin_enqueue_scripts', [$this, 'admin_scripts']);
         //woocommerce available payment gateways
         add_action('woocommerce_available_payment_gateways', [$this, 'available_payment_gateways']);
+        // Carousel HTML only on checkout UI — core keeps `$this->title` plain; see inject_checkout_carousel().
+        add_filter('woocommerce_gateway_title', [$this, 'inject_checkout_carousel'], 10, 2);
         //register receipt page
         add_action('woocommerce_receipt_' . $this->id, [$this, 'receipt_page']);
         //register api endpoint
@@ -139,13 +145,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         //register webhook endpoint for server-to-server payment notifications
         add_action('woocommerce_api_acountpay_webhook', [$this, 'handle_webhook']);
 
-        // Strip HTML from the stored payment_method_title on every new
-        // checkout. Without this, the rich bank-logo carousel rendered by
-        // get_title() gets baked into the order's _payment_method_title
-        // column and then re-displayed (escaped) in the admin order view,
-        // transactional emails and PDF invoices — which is what surfaces
-        // as "raw HTML in admin orders" / "scrambled text + giant logos
-        // in invoices" in merchant bug reports.
+        // Belt-and-brackets: force plain payment_method_title on new orders (blocks + edge cases).
         add_action('woocommerce_checkout_create_order', [$this, 'set_plain_payment_method_title'], 10, 2);
         // Also catch the Block checkout / Store API path, which doesn't
         // run woocommerce_checkout_create_order.
@@ -208,7 +208,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
      *
      * Kept for backwards compatibility / the woocommerce_acountpay_payment_icon
      * filter, but no longer rendered by default — we now show a configurable
-     * bank-logo carousel inside get_title().
+     * bank-logo carousel on checkout via {@see inject_checkout_carousel()}.
      */
     public function get_logo_url()
     {
@@ -716,19 +716,75 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
     }
 
     /**
-     * Filter gateway title output: render the title, an auto-scrolling carousel
-     * of the merchant-selected bank logos, and an optional "i" info bubble.
+     * Rich checkout label (carousel + info bubble) via `woocommerce_gateway_title`.
+     * `$this->title` and {@see get_title()} remain plain — WooCommerce passes the title
+     * through this filter when rendering payment methods.
+     *
+     * @param string $title       Plain gateway title (same as stored option).
+     * @param string $gateway_id  Gateway id.
+     * @return string
      */
-    public function get_title()
+    public function inject_checkout_carousel($title, $gateway_id)
     {
-        $title  = parent::get_title();
+        if ($gateway_id !== $this->id) {
+            return $title;
+        }
+        $title = wp_strip_all_tags((string) $title);
+        if (!$this->should_inject_checkout_carousel()) {
+            return $title;
+        }
+
+        return $this->build_checkout_carousel_html($title);
+    }
+
+    /**
+     * Only inject carousel markup when drawing the checkout payment UI — not when
+     * submitting an order, handling REST/Store API, pay-for-order, or thank-you.
+     *
+     * @return bool
+     */
+    protected function should_inject_checkout_carousel()
+    {
+        if (is_admin() && !wp_doing_ajax()) {
+            return false;
+        }
+        if (!function_exists('is_checkout') || !is_checkout()) {
+            return false;
+        }
+        if (function_exists('is_wc_endpoint_url')) {
+            if (is_wc_endpoint_url('order-pay') || is_wc_endpoint_url('order-received')) {
+                return false;
+            }
+        }
+        // Classic checkout final submit — `get_title()` is used when saving the order; keep plain.
+        if (!empty($_POST['woocommerce_checkout_place_order'])) {
+            return false;
+        }
+        // Block / Store API — carousel comes from block scripts + payment method data.
+        if (defined('REST_REQUEST') && REST_REQUEST) {
+            return false;
+        }
+        if (function_exists('wp_is_json_request') && wp_is_json_request()) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Build the same structure we previously returned from get_title().
+     *
+     * @param string $plain_title Escaped inner label text.
+     * @return string
+     */
+    protected function build_checkout_carousel_html($plain_title)
+    {
         $output = '<span class="acountpay-payment-label">'
-            . '<span class="acountpay-payment-title">' . $title . '</span>';
+            . '<span class="acountpay-payment-title">' . esc_html($plain_title) . '</span>';
 
         $logos = $this->get_bank_logo_urls();
         if (!empty($logos)) {
             $items = '';
-            // Render the list twice so the marquee can translateX(-50%) seamlessly.
             foreach (array_merge($logos, $logos) as $logo) {
                 $items .= '<img class="acountpay-bank-logo" src="' . esc_url($logo['url']) . '" alt="' . esc_attr($logo['name']) . '" loading="lazy" />';
             }
@@ -754,12 +810,12 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         }
 
         $output .= '</span>';
+
         return $output;
     }
 
     /**
      * Canonical plain-text label stored on orders for invoices, emails and admin.
-     * Checkout still shows the rich HTML label from `get_title()` (carousel + bubble).
      *
      * @return string
      */
@@ -878,15 +934,9 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
     }
 
     /**
-     * Force-set the order's stored payment_method_title to plain text.
-     *
-     * `get_title()` returns rich HTML (bank-logo carousel + info bubble)
-     * because the classic checkout label needs it. WooCommerce, on
-     * checkout submission, copies whatever `get_title()` returns into
-     * `_payment_method_title` and that copy is what every downstream
-     * surface (admin orders, emails, PDF invoices, REST) renders. We
-     * always persist the canonical plain label ("Pay by Bank") so it
-     * matches invoices and is independent of the configurable checkout title.
+     * Force-set the order's stored payment_method_title to the canonical plain label.
+     * Safety net if `get_title()` is read in a context where the checkout carousel
+     * filter still runs, and to match invoice/emails to a stable string.
      *
      * @param WC_Order $order
      * @param array    $data Posted checkout data.
@@ -1569,6 +1619,11 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         $previous_api_url   = (string) $this->get_option('api_base_url', 'https://api.acountpay.com');
 
         parent::process_admin_options();
+
+        $this->title = wp_strip_all_tags((string) $this->get_option('title', __('Pay by Bank', ACOUNTPAY_TEXT_DOMAIN)));
+        if ($this->title === '') {
+            $this->title = __('Pay by Bank', ACOUNTPAY_TEXT_DOMAIN);
+        }
 
         $new_countries = $this->get_bank_countries();
         $new_api_url   = (string) $this->get_option('api_base_url', 'https://api.acountpay.com');
@@ -2865,8 +2920,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             echo '<p>' . esc_html__('Not a Pay by Bank order.', ACOUNTPAY_TEXT_DOMAIN) . '</p>';
             return;
         }
-        // Legacy installs stored rich HTML from get_title() in _payment_method_title; loading this
-        // screen persists plain text so admin headers / exports stop embedding carousel markup.
+        // Legacy installs stored carousel HTML in _payment_method_title; loading this screen persists plain text.
         $stored_pt = (string) $order->get_meta('_payment_method_title', true);
         if ($stored_pt !== '' && strpos($stored_pt, '<') !== false) {
             $order->set_payment_method_title($this->get_stored_payment_method_title());
