@@ -36,6 +36,14 @@ class AcountPay_API
     private $sslverify_enabled;
 
     /**
+     * Merchant client id (Woo gateway setting) — sent on transaction-status
+     * so the API can scope reference lookups to the correct merchant row.
+     *
+     * @var string
+     */
+    private $merchant_client_id = '';
+
+    /**
      * Constructor
      * 
      * @param string $api_base_url API Base URL (optional)
@@ -52,6 +60,16 @@ class AcountPay_API
         } else {
             $this->api_base_url = rtrim($api_base_url, '/');
         }
+    }
+
+    /**
+     * Optional: merchant SDK/Woo client id for scoped transaction-status lookups.
+     *
+     * @param string $client_id
+     */
+    public function set_merchant_client_id($client_id)
+    {
+        $this->merchant_client_id = trim((string) $client_id);
     }
 
     /**
@@ -406,18 +424,35 @@ class AcountPay_API
 
     /**
      * Verify payment status with the backend.
-     * Uses the notifications/transaction-status endpoint to check actual payment status.
+     * Uses GET /v1/notifications/transaction-status with paymentId (preferred),
+     * referenceNumber, and optional clientId so the correct payment row is used.
      *
-     * @param string $reference_number The order reference number
+     * @param string $reference_number Woo reference / order number (may be empty if payment_id is set).
+     * @param string $payment_id       Internal AcountPay payment id from order meta (numeric).
      * @return array|WP_Error Payment status data or WP_Error on failure
      */
-    public function verify_payment_status($reference_number)
+    public function verify_payment_status($reference_number = '', $payment_id = '')
     {
-        $endpoint = '/v1/notifications/transaction-status?referenceNumber=' . urlencode($reference_number);
+        $params = array();
+        $payment_id = preg_replace('/\D/', '', (string) $payment_id);
+        if ($payment_id !== '') {
+            $params['paymentId'] = $payment_id;
+        }
+        $reference_number = trim((string) $reference_number);
+        if ($reference_number !== '') {
+            $params['referenceNumber'] = $reference_number;
+        }
+        if ($this->merchant_client_id !== '') {
+            $params['clientId'] = $this->merchant_client_id;
+        }
+        if ($payment_id === '' && $reference_number === '') {
+            return new WP_Error(
+                'missing_params',
+                __('Payment reference or payment ID is required.', 'acountpay-payment')
+            );
+        }
 
-        $response = $this->make_request($endpoint, 'GET');
-
-        return $response;
+        return $this->make_request('/v1/notifications/transaction-status', 'GET', $params);
     }
 
     /**

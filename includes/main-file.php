@@ -115,6 +115,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         $logging_enabled = $this->logging === 'yes';
         $sslverify_enabled = $this->sslverify === 'yes';
         $this->api = new AcountPay_API($api_base_url, $logging_enabled, $sslverify_enabled);
+        $this->api->set_merchant_client_id(trim((string) $this->get_option('client_id', '')));
 
         // Don't let the customer cancel an order from My Account while it's
         // still pending — the webhook may already be in flight and cancelling
@@ -640,6 +641,31 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         }
 
         return apply_filters('woocommerce_acountpay_payment_reference', $rendered, $order, $this->id);
+    }
+
+    /**
+     * Re-poll AcountPay transaction status for this order using the internal
+     * payment id (when known) and gateway client id so the API cannot return
+     * another merchant's payment that shares the same reference string.
+     *
+     * @param WC_Order $order
+     * @return array|WP_Error
+     */
+    public function verify_payment_status_for_order($order)
+    {
+        if (!isset($this->api) || !$this->api) {
+            return new WP_Error('acountpay_no_api', __('API not initialised.', ACOUNTPAY_TEXT_DOMAIN));
+        }
+        if (!$order instanceof WC_Order) {
+            return new WP_Error('acountpay_no_order', __('Invalid order.', ACOUNTPAY_TEXT_DOMAIN));
+        }
+        $reference = (string) $order->get_meta('_acountpay_reference_number');
+        if ($reference === '') {
+            $reference = (string) $order->get_order_number();
+        }
+        $payment_id = preg_replace('/\D/', '', (string) $order->get_meta('_acountpay_payment_id'));
+
+        return $this->api->verify_payment_status($reference, $payment_id);
     }
 
     /**
@@ -1893,8 +1919,11 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         if (!$order || $order->get_payment_method() !== $this->id) {
             return;
         }
-        // Already terminal in Woo? Don't bother polling.
-        if (in_array($order->get_status(), array('processing', 'completed', 'refunded', 'failed'), true)) {
+        // Terminal Woo states: stop polling. `processing` is *not* terminal for
+        // bank payments — the order may be "processing" while the backend is still
+        // pending or later reports failure; skipping here left those orders stuck
+        // (settings "Failed on payment failure" never applied when webhooks were missed).
+        if (in_array($order->get_status(), array('completed', 'refunded', 'failed', 'cancelled'), true)) {
             return;
         }
         if (!isset($this->api) || !$this->api) {
@@ -1904,11 +1933,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             return;
         }
 
-        $reference = (string) $order->get_meta('_acountpay_reference_number');
-        if ($reference === '') {
-            $reference = (string) $order->get_order_number();
-        }
-        $result = $this->api->verify_payment_status($reference);
+        $result = $this->verify_payment_status_for_order($order);
         if (is_wp_error($result) || !is_array($result)) {
             $this->log_warning('Scheduled reverify: backend unreachable', array(
                 'order_id' => $order_id,
@@ -2064,26 +2089,26 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                 }
             }
 
-            // Already final? Just bounce to the thank-you page.
+            $url_status = isset($_GET['status']) ? strtolower(sanitize_text_field(wp_unslash($_GET['status']))) : '';
+
+            // Already paid / terminal — bounce to thank-you unless the signed URL carries an
+            // explicit abandon hint from the POS so we can undo a premature processing state.
             if (in_array($order->get_status(), array('completed', 'processing', 'refunded'), true)) {
-                wp_safe_redirect($order->get_checkout_order_received_url());
-                exit;
+                if (!in_array($url_status, array('cancelled', 'canceled', 'failed'), true)) {
+                    wp_safe_redirect($order->get_checkout_order_received_url());
+                    exit;
+                }
             }
 
             // Treat the URL `status` as a HINT only — the source of truth is
             // the backend verification call (and the signed webhook). Bank
             // redirects can arrive with stale or even forged status values.
-            $url_status = isset($_GET['status']) ? strtolower(sanitize_text_field(wp_unslash($_GET['status']))) : '';
             $this->log_info('Payment callback: verifying with backend', array('order_id' => $order_id, 'url_status' => $url_status));
 
             $backend_status = '';
             $backend_unreachable = false;
             if (isset($this->api) && $this->api) {
-                $reference = (string) $order->get_meta('_acountpay_reference_number');
-                if ($reference === '') {
-                    $reference = (string) $order->get_order_number();
-                }
-                $verify_result = $this->api->verify_payment_status($reference);
+                $verify_result = $this->verify_payment_status_for_order($order);
                 if (!is_wp_error($verify_result) && is_array($verify_result)) {
                     $backend_status = isset($verify_result['status']) ? (string) $verify_result['status'] : '';
                     $this->log_info('Payment callback: backend status', array('order_id' => $order_id, 'backend_status' => $backend_status));
@@ -2104,6 +2129,32 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             // which looks like a successful order to them.
             $is_user_cancelled = in_array($url_status, array('cancelled', 'canceled', 'failed'), true)
                 && ($bucket === 'pending' || $backend_unreachable || $backend_status === '');
+
+            // POS "Pay with card instead" appends ?status=cancelled after calling cancel on the
+            // backend, but verify can still briefly return authorized/paid before the cancel is
+            // visible — classify_backend_status maps those to "paid" and we would otherwise send
+            // the shopper to the thank-you page. Honor the signed URL's abandon hint first.
+            if ($bucket === 'paid' && in_array($url_status, array('cancelled', 'canceled', 'failed'), true)) {
+                $this->log_warning('Payment callback: URL abandon hint conflicts with backend paid; failing order locally (race after POS cancel)', array(
+                    'order_id'       => $order_id,
+                    'url_status'     => $url_status,
+                    'backend_status' => $backend_status,
+                ));
+                $order->add_order_note(sprintf(
+                    __('Pay by Bank: customer abandoned at POS (URL hint: %1$s) while verification briefly showed %2$s — order marked not paid; webhook must agree with live API before completing.', ACOUNTPAY_TEXT_DOMAIN),
+                    $url_status,
+                    $backend_status
+                ));
+                $order->set_payment_method_title($this->get_stored_payment_method_title());
+                $this->apply_failed_status($order, $url_status ?: 'cancelled');
+                if (function_exists('as_unschedule_all_actions')) {
+                    as_unschedule_all_actions('acountpay_reverify_pending_order', array($order_id), 'acountpay');
+                }
+                $order->save();
+                wc_add_notice(__('Payment was cancelled. Please try again or pick a different payment method.', ACOUNTPAY_TEXT_DOMAIN), 'error');
+                wp_safe_redirect(wc_get_checkout_url());
+                exit;
+            }
 
             if ($bucket === 'paid') {
                 wc_add_notice(__('Payment successful, thank you for your order.', ACOUNTPAY_TEXT_DOMAIN), 'success');
@@ -2283,6 +2334,74 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
     }
 
     /**
+     * Re-poll the AcountPay API for the order's reference. Used to ensure a
+     * "success" webhook never marks an order paid when the live status is
+     * already failed/cancelled (e.g. after POS "Pay with card instead").
+     *
+     * @param WC_Order $order
+     * @return array{bucket: string, status: string, error: \WP_Error|null}
+     */
+    protected function get_live_payment_verification_for_order($order)
+    {
+        if (!isset($this->api) || !$this->api) {
+            return array(
+                'bucket'  => 'pending',
+                'status'  => '',
+                'error'   => new WP_Error('acountpay_no_api', __('API not initialised.', ACOUNTPAY_TEXT_DOMAIN)),
+            );
+        }
+        $pid = preg_replace('/\D/', '', (string) $order->get_meta('_acountpay_payment_id'));
+        $reference = (string) $order->get_meta('_acountpay_reference_number');
+        if ($reference === '') {
+            $reference = (string) $order->get_order_number();
+        }
+        if ($reference === '' && $pid === '') {
+            return array(
+                'bucket'  => 'pending',
+                'status'  => '',
+                'error'   => new WP_Error('acountpay_no_ref', __('No payment reference or payment ID on order.', ACOUNTPAY_TEXT_DOMAIN)),
+            );
+        }
+        $verify_result = $this->verify_payment_status_for_order($order);
+        if (is_wp_error($verify_result)) {
+            return array(
+                'bucket'  => 'pending',
+                'status'  => '',
+                'error'   => $verify_result,
+            );
+        }
+        if (!is_array($verify_result)) {
+            return array(
+                'bucket'  => 'pending',
+                'status'  => '',
+                'error'   => new WP_Error('acountpay_bad_verify', __('Unexpected verify response.', ACOUNTPAY_TEXT_DOMAIN)),
+            );
+        }
+        $backend_status = isset($verify_result['status']) ? (string) $verify_result['status'] : '';
+
+        return array(
+            'bucket' => $this->classify_backend_status($backend_status),
+            'status' => $backend_status,
+            'error'  => null,
+        );
+    }
+
+    /**
+     * Record that a webhook delivery was applied so duplicate retries can be ignored.
+     *
+     * @param WC_Order $order
+     * @param string   $event_id
+     */
+    protected function mark_webhook_event_id_terminal($order, $event_id)
+    {
+        if (!$order instanceof WC_Order || $event_id === '') {
+            return;
+        }
+        $order->update_meta_data('_acountpay_last_webhook_event_id', $event_id);
+        set_transient('acountpay_webhook_seen_' . md5($event_id), 1, DAY_IN_SECONDS);
+    }
+
+    /**
      * Handle server-to-server webhook from AcountPay backend.
      * Called when payment status changes (via Token.io webhook -> backend -> here).
      */
@@ -2328,19 +2447,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             return;
         }
 
-        // Dedup by event id when present. AcountPay may retry deliveries on
-        // 5xx — we don't want a second delivery to e.g. fire payment_complete
-        // again or replay a refund.
         $event_id = isset($data['eventId']) ? sanitize_text_field((string) $data['eventId']) : '';
-        if ($event_id !== '') {
-            $seen_key = 'acountpay_webhook_seen_' . md5($event_id);
-            if (get_transient($seen_key)) {
-                $this->log_info('Webhook: duplicate event, ignoring', array('event_id' => $event_id));
-                wp_send_json(array('received' => true, 'duplicate' => true));
-                return;
-            }
-            set_transient($seen_key, 1, DAY_IN_SECONDS);
-        }
 
         // Trust the signed body, not query-string `order_id` (which is just a
         // routing hint and can be tampered with by the caller). Resolve the
@@ -2441,24 +2548,10 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             if (!$is_partial && $order->get_status() !== 'refunded') {
                 $order->update_status('refunded', $note);
             }
+            $this->mark_webhook_event_id_terminal($order, $event_id);
             $order->save();
             wp_send_json(array('received' => true, 'updated' => true, 'kind' => 'refund'));
             return;
-        }
-
-        // Per-order eventId dedup — complements the plugin-wide transient
-        // dedup at the top of this handler. Stored on the order itself so an
-        // admin can see the last delivery from the order edit screen, and so
-        // dedup state survives transient cache flushes.
-        if ($event_id !== '') {
-            $last_event_id = (string) $order->get_meta('_acountpay_last_webhook_event_id');
-            if ($last_event_id !== '' && $last_event_id === $event_id) {
-                $order->save();
-                $this->log_info('Webhook: duplicate eventId on order, ignoring', array('order_id' => $order->get_id(), 'event_id' => $event_id));
-                wp_send_json(array('received' => true, 'duplicate' => true));
-                return;
-            }
-            $order->update_meta_data('_acountpay_last_webhook_event_id', $event_id);
         }
 
         // Classify the event using the same buckets as the callback handler
@@ -2474,6 +2567,17 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
 
         $is_failure_event = ($event_bucket === 'failed');
         $is_success_event = ($event_bucket === 'paid');
+
+        // True duplicate: same eventId redelivered after we already marked this order paid.
+        if ($event_id !== '' && $is_success_event && in_array($current_status, array('processing', 'completed'), true)) {
+            $last_event_id = (string) $order->get_meta('_acountpay_last_webhook_event_id');
+            if ($last_event_id !== '' && $last_event_id === $event_id) {
+                $order->save();
+                $this->log_info('Webhook: duplicate success delivery for already-paid order', array('order_id' => $order->get_id(), 'event_id' => $event_id));
+                wp_send_json(array('received' => true, 'duplicate' => true));
+                return;
+            }
+        }
 
         // POST-AUTHORIZATION REVERSAL: if the order is already `processing`
         // (we treated INITIATION_COMPLETED as paid) and the bank later
@@ -2502,16 +2606,54 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         }
 
         if ($is_success_event) {
+            $live = $this->get_live_payment_verification_for_order($order);
+            if ($live['error']) {
+                $this->log_warning('Webhook: success event but live verification request failed; not marking paid', array(
+                    'order_id' => $order->get_id(),
+                    'error'    => $live['error']->get_error_message(),
+                ));
+                $order->add_order_note(sprintf(
+                    /* translators: %s: error message from verify API */
+                    __('Pay by Bank: webhook reported success but live verification failed (%s). Order not marked paid — use “Re-verify status” or wait for the next webhook.', ACOUNTPAY_TEXT_DOMAIN),
+                    $live['error']->get_error_message()
+                ));
+                $order->save();
+                wp_send_json(array('received' => true, 'verify_error' => true));
+                return;
+            }
+            if ($live['bucket'] !== 'paid') {
+                $this->log_warning('Webhook: success event ignored — live API disagrees', array(
+                    'order_id'      => $order->get_id(),
+                    'live_bucket'   => $live['bucket'],
+                    'live_status'   => $live['status'],
+                    'webhook_status'=> $status,
+                ));
+                $order->add_order_note(sprintf(
+                    __('Pay by Bank: webhook reported success but live API status is %1$s (bucket: %2$s). Order not marked paid from webhook.', ACOUNTPAY_TEXT_DOMAIN),
+                    $live['status'] !== '' ? $live['status'] : __('empty', ACOUNTPAY_TEXT_DOMAIN),
+                    $live['bucket']
+                ));
+                if ($live['bucket'] === 'failed') {
+                    $this->apply_failed_status($order, $live['status'] ?: 'live_verify_failed');
+                }
+                $this->mark_webhook_event_id_terminal($order, $event_id);
+                $order->save();
+                wp_send_json(array('received' => true, 'ignored_stale_success' => true));
+                return;
+            }
+
             $order->add_order_note(sprintf(
-                __('Pay by Bank: payment confirmed via webhook (status: %1$s, amount: %2$s %3$s).', ACOUNTPAY_TEXT_DOMAIN),
+                __('Pay by Bank: payment confirmed via webhook (status: %1$s, amount: %2$s %3$s). Live API: %4$s.', ACOUNTPAY_TEXT_DOMAIN),
                 $status,
                 $amount !== null ? number_format($amount, 2) : 'N/A',
-                $currency ?: $order->get_currency()
+                $currency ?: $order->get_currency(),
+                $live['status']
             ));
             if ($current_status !== 'processing' && $current_status !== 'completed') {
                 $order->payment_complete($payment_id);
             }
             $this->maybe_apply_paid_status_mapping($order);
+            $this->mark_webhook_event_id_terminal($order, $event_id);
             // Webhook closed the loop — cancel any pending background polls.
             if (function_exists('as_unschedule_all_actions')) {
                 as_unschedule_all_actions('acountpay_reverify_pending_order', array($order->get_id()), 'acountpay');
@@ -2521,6 +2663,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                 $order->add_order_note(__('Pay by Bank: payment authorisation later reversed by the bank during settlement. Order moved to Failed automatically.', ACOUNTPAY_TEXT_DOMAIN));
             }
             $this->apply_failed_status($order, $status ?: $internal_status);
+            $this->mark_webhook_event_id_terminal($order, $event_id);
             if (function_exists('as_unschedule_all_actions')) {
                 as_unschedule_all_actions('acountpay_reverify_pending_order', array($order->get_id()), 'acountpay');
             }
@@ -2603,6 +2746,13 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         if (!$order || $order->get_payment_method() !== $this->id) {
             echo '<p>' . esc_html__('Not a Pay by Bank order.', ACOUNTPAY_TEXT_DOMAIN) . '</p>';
             return;
+        }
+        // Legacy installs stored rich HTML from get_title() in _payment_method_title; loading this
+        // screen persists plain text so admin headers / exports stop embedding carousel markup.
+        $stored_pt = (string) $order->get_meta('_payment_method_title', true);
+        if ($stored_pt !== '' && strpos($stored_pt, '<') !== false) {
+            $order->set_payment_method_title($this->get_stored_payment_method_title());
+            $order->save();
         }
         $pid       = (string) $order->get_meta('_acountpay_payment_id');
         $ref       = (string) $order->get_meta('_acountpay_reference_number');
@@ -2689,11 +2839,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         if (!isset($this->api) || !$this->api) {
             wp_send_json_error(array('message' => __('API not initialised.', ACOUNTPAY_TEXT_DOMAIN)));
         }
-        $reference = (string) $order->get_meta('_acountpay_reference_number');
-        if ($reference === '') {
-            $reference = (string) $order->get_order_number();
-        }
-        $result = $this->api->verify_payment_status($reference);
+        $result = $this->verify_payment_status_for_order($order);
         if (is_wp_error($result)) {
             wp_send_json_error(array('message' => $result->get_error_message()));
         }
