@@ -6,7 +6,7 @@
  * Author:      AcountPay
  * Author URI:  https://acountpay.com
  * Description: Pay by Bank for WooCommerce, powered by AcountPay. Lets shoppers pay directly from their bank account via PSD2 / open banking, with a configurable bank-logo carousel, classic + block checkout support, signed callbacks, signed server-to-server webhooks, an order-edit panel showing payment id and PSU lookup state, and a manual-refund flow driven from the AcountPay Merchant Dashboard.
- * Version:     2.1.11
+ * Version:     2.1.13
  * Requires at least: 5.8
  * Tested up to: 6.9.1
  * Requires PHP: 7.4
@@ -23,7 +23,7 @@ if (!defined('ABSPATH')) {
 }
 
 //define the plugin constants
-define('ACOUNTPAY_PAYMENT_VERSION', '2.1.11');
+define('ACOUNTPAY_PAYMENT_VERSION', '2.1.13');
 define('ACOUNTPAY_PAYMENT_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('ACOUNTPAY_PAYMENT_PLUGIN_PATH', plugin_dir_path(__FILE__));
 define('ACOUNTPAY_TEXT_DOMAIN', 'acountpay-payment');
@@ -50,6 +50,16 @@ if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get
     //who upgrade past a release with a broken /banks endpoint don't have to
     //wait up to 7 days for the stale-cache fallback to expire on its own.
     add_action('plugins_loaded', 'acountpay_payment_maybe_flush_bank_cache', 11);
+
+    // Reconciliation cron — 15-minute global sweep that catches stale
+    // pending orders even when the per-order Action Scheduler reverify
+    // failed to register (e.g. older orders pre-dating the action
+    // scheduler hook, or AS table flushes). Self-heals on init.
+    register_activation_hook(__FILE__, 'acountpay_payment_activate');
+    register_deactivation_hook(__FILE__, 'acountpay_payment_deactivate');
+    add_filter('cron_schedules', 'acountpay_payment_cron_schedules');
+    add_action('init', 'acountpay_payment_ensure_cron_scheduled');
+    add_action('acountpay_reconcile_pending_orders', 'acountpay_payment_reconcile_pending_orders');
     //add settings url
     add_filter('plugin_action_links_' . plugin_basename(__FILE__), 'acountpay_payment_settings_link');
     //register woocommerce payment gateway
@@ -316,6 +326,12 @@ function acountpay_payment_init()
  * plugin version stored in wp_options doesn't match the version constant.
  * This makes upgrades self-healing — merchants don't need to manually click
  * "Refresh bank list" after pulling a build that fixed the API path.
+ *
+ * Also runs the one-time scrubs that need to fire on plugin upgrade:
+ *   - Strip HTML out of saved `title` and `description` settings (older
+ *     installs may have a bank-logo carousel pasted in there).
+ *   - Strip HTML out of `_payment_method_title` on existing AcountPay
+ *     orders so admin/email/invoice surfaces stop showing raw markup.
  */
 function acountpay_payment_maybe_flush_bank_cache()
 {
@@ -327,7 +343,89 @@ function acountpay_payment_maybe_flush_bank_cache()
         delete_transient('acountpay_banks_' . $cc);
         delete_transient('acountpay_banks_' . $cc . '_stale');
     }
+    acountpay_payment_scrub_legacy_html_settings();
+    acountpay_payment_scrub_legacy_html_orders();
     update_option('acountpay_payment_version', ACOUNTPAY_PAYMENT_VERSION, false);
+}
+
+/**
+ * One-shot: strip HTML from any saved gateway `title` / `description`
+ * options that older plugin versions allowed merchants to paste raw
+ * markup into. Idempotent — only writes back when something actually
+ * changed.
+ */
+function acountpay_payment_scrub_legacy_html_settings()
+{
+    $settings = get_option('woocommerce_acountpay_payment_settings', array());
+    if (!is_array($settings)) {
+        return;
+    }
+    $changed = false;
+    foreach (array('title', 'description') as $field) {
+        if (isset($settings[$field]) && is_string($settings[$field])) {
+            $clean = wp_strip_all_tags($settings[$field]);
+            if ($clean !== $settings[$field]) {
+                $settings[$field] = $clean;
+                $changed = true;
+            }
+        }
+    }
+    if ($changed) {
+        update_option('woocommerce_acountpay_payment_settings', $settings);
+    }
+}
+
+/**
+ * One-shot: normalize `_payment_method_title` on existing AcountPay orders
+ * to the canonical plain label "Pay by Bank" so the DB matches what invoices
+ * and emails show (and so HTML/carousel blobs from older plugin builds are
+ * removed wholesale). Paged in batches to avoid a single request timing out
+ * on very large stores (max ~25k orders per upgrade request).
+ */
+function acountpay_payment_scrub_legacy_html_orders()
+{
+    if (!function_exists('wc_get_orders')) {
+        return;
+    }
+    $canonical = __('Pay by Bank', ACOUNTPAY_TEXT_DOMAIN);
+    $per_page  = 500;
+    $max_pages = 50;
+
+    for ($page = 1; $page <= $max_pages; $page++) {
+        try {
+            $orders = wc_get_orders(array(
+                'limit'          => $per_page,
+                'paged'          => $page,
+                'payment_method' => 'acountpay_payment',
+                'status'         => 'any',
+                'orderby'        => 'ID',
+                'order'          => 'DESC',
+                'return'         => 'objects',
+            ));
+        } catch (\Throwable $e) {
+            return;
+        }
+        if (empty($orders)) {
+            return;
+        }
+        foreach ($orders as $order) {
+            if (!$order instanceof WC_Order) {
+                continue;
+            }
+            // Read unfiltered stored title — never use get_payment_method_title()
+            // here because the gateway filter would mask legacy HTML in meta.
+            $data     = $order->get_data();
+            $stored   = isset($data['payment_method_title']) ? (string) $data['payment_method_title'] : '';
+            $stripped = wp_strip_all_tags($stored);
+            if ($stripped !== $canonical || $stored !== $canonical) {
+                $order->set_payment_method_title($canonical);
+                $order->save();
+            }
+        }
+        if (count($orders) < $per_page) {
+            return;
+        }
+    }
 }
 
 //acountpay_payment_woocommerce_notice
@@ -353,4 +451,144 @@ function acountpay_payment_gateway($gateways)
 {
     $gateways[] = 'AcountPay_Payment_Gateway';
     return $gateways;
+}
+
+/**
+ * Register a 15-minute schedule used by the reconciliation cron.
+ */
+function acountpay_payment_cron_schedules($schedules)
+{
+    if (!isset($schedules['acountpay_fifteen_minutes'])) {
+        $schedules['acountpay_fifteen_minutes'] = array(
+            'interval' => 15 * MINUTE_IN_SECONDS,
+            'display'  => __('Every 15 minutes (AcountPay)', 'acountpay-payment'),
+        );
+    }
+    return $schedules;
+}
+
+/**
+ * Self-heal the cron schedule on every load. wp_schedule_event is a
+ * no-op if the event is already scheduled, so this is cheap.
+ */
+function acountpay_payment_ensure_cron_scheduled()
+{
+    if (!wp_next_scheduled('acountpay_reconcile_pending_orders')) {
+        wp_schedule_event(time() + 5 * MINUTE_IN_SECONDS, 'acountpay_fifteen_minutes', 'acountpay_reconcile_pending_orders');
+    }
+}
+
+/**
+ * Plugin activation: schedule the reconciliation cron.
+ */
+function acountpay_payment_activate()
+{
+    acountpay_payment_ensure_cron_scheduled();
+}
+
+/**
+ * Plugin deactivation: clear scheduled events so they don't keep firing
+ * after the plugin is disabled.
+ */
+function acountpay_payment_deactivate()
+{
+    $timestamp = wp_next_scheduled('acountpay_reconcile_pending_orders');
+    if ($timestamp) {
+        wp_unschedule_event($timestamp, 'acountpay_reconcile_pending_orders');
+    }
+    wp_clear_scheduled_hook('acountpay_reconcile_pending_orders');
+}
+
+/**
+ * 15-minute global sweep that re-polls the AcountPay backend for any
+ * AcountPay orders that have been pending / on-hold for more than 30
+ * minutes. The per-order Action Scheduler reverify
+ * (`acountpay_reverify_pending_order`) is the primary path; this
+ * exists as a safety net for orders the per-order scheduler missed
+ * (older orders pre-dating the Action Scheduler hook, AS table flushes
+ * etc).
+ *
+ * Capped at 50 orders per sweep so a backlog after a long outage
+ * doesn't time the cron worker out — subsequent runs continue.
+ */
+function acountpay_payment_reconcile_pending_orders()
+{
+    if (!function_exists('wc_get_orders')) {
+        return;
+    }
+    $gateway = acountpay_resolve_gateway();
+    if (!$gateway || !isset($gateway->api) || !$gateway->api) {
+        return;
+    }
+
+    $cutoff = time() - 30 * MINUTE_IN_SECONDS;
+
+    try {
+        $orders = wc_get_orders(array(
+            'limit'          => 50,
+            'status'         => array('pending', 'on-hold'),
+            'payment_method' => 'acountpay_payment',
+            'date_created'   => '<' . $cutoff,
+            'orderby'        => 'date',
+            'order'          => 'ASC',
+            'return'         => 'objects',
+        ));
+    } catch (\Throwable $e) {
+        return;
+    }
+
+    if (empty($orders)) {
+        return;
+    }
+
+    foreach ($orders as $order) {
+        if (!$order instanceof WC_Order) {
+            continue;
+        }
+        $order_id = $order->get_id();
+
+        $reference = (string) $order->get_meta('_acountpay_reference_number');
+        if ($reference === '') {
+            $reference = (string) $order->get_order_number();
+        }
+        if ($reference === '') {
+            continue;
+        }
+
+        $result = $gateway->api->verify_payment_status($reference);
+        if (is_wp_error($result) || !is_array($result)) {
+            // After 24h still unable to reach the backend / resolve the
+            // payment — auto-fail locally so the order stops looking
+            // perpetually pending to the merchant.
+            $created = $order->get_date_created();
+            $age = $created ? (time() - $created->getTimestamp()) : 0;
+            if ($age >= DAY_IN_SECONDS && method_exists($gateway, 'apply_failed_status')) {
+                $err = is_wp_error($result) ? $result->get_error_message() : 'invalid response';
+                $gateway->apply_failed_status($order, sprintf('reconcile failed (%s)', $err));
+                $order->add_order_note(sprintf(
+                    /* translators: %s: error message returned by the AcountPay API */
+                    __('Reconciled from AcountPay: backend unreachable for >24h, auto-failed (%s).', 'acountpay-payment'),
+                    $err
+                ));
+            }
+            continue;
+        }
+
+        $backend_status = isset($result['status']) ? (string) $result['status'] : '';
+        if ($backend_status === '') {
+            continue;
+        }
+
+        if (method_exists($gateway, 'apply_backend_status_to_order')) {
+            $bucket = $gateway->apply_backend_status_to_order($order, $backend_status);
+            if (in_array($bucket, array('paid', 'failed', 'refunded'), true)) {
+                $order->add_order_note(sprintf(
+                    /* translators: %1$s: bucket (paid/failed/refunded), %2$s: AcountPay backend status */
+                    __('Reconciled from AcountPay (%1$s) — backend status: %2$s.', 'acountpay-payment'),
+                    $bucket,
+                    $backend_status
+                ));
+            }
+        }
+    }
 }

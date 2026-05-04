@@ -137,6 +137,23 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         add_action('woocommerce_api_acountpay_payment_gateway', [$this, 'acountpay_payment_callback']);
         //register webhook endpoint for server-to-server payment notifications
         add_action('woocommerce_api_acountpay_webhook', [$this, 'handle_webhook']);
+
+        // Strip HTML from the stored payment_method_title on every new
+        // checkout. Without this, the rich bank-logo carousel rendered by
+        // get_title() gets baked into the order's _payment_method_title
+        // column and then re-displayed (escaped) in the admin order view,
+        // transactional emails and PDF invoices — which is what surfaces
+        // as "raw HTML in admin orders" / "scrambled text + giant logos
+        // in invoices" in merchant bug reports.
+        add_action('woocommerce_checkout_create_order', [$this, 'set_plain_payment_method_title'], 10, 2);
+        // Also catch the Block checkout / Store API path, which doesn't
+        // run woocommerce_checkout_create_order.
+        add_action('woocommerce_store_api_checkout_update_order_from_request', [$this, 'set_plain_payment_method_title_from_request'], 10, 2);
+        // Invoices, emails and PDF generators read `payment_method_title`
+        // from the order — force the canonical plain label on every read
+        // so legacy rows (HTML carousel baked in before v2.1.12) never
+        // surface bank logos outside checkout.
+        add_filter('woocommerce_order_get_payment_method_title', [$this, 'filter_order_payment_method_title'], 10, 2);
         //admin notice when the site URL is not publicly reachable (local/docker testing)
         add_action('admin_notices', [$this, 'maybe_render_unreachable_host_notice']);
         //admin notice when the gateway is enabled but the webhook signing secret is blank
@@ -687,6 +704,102 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
 
         $output .= '</span>';
         return $output;
+    }
+
+    /**
+     * Canonical plain-text label stored on orders for invoices, emails and admin.
+     * Checkout still shows the rich HTML label from `get_title()` (carousel + bubble).
+     *
+     * @return string
+     */
+    public function get_stored_payment_method_title()
+    {
+        return __('Pay by Bank', ACOUNTPAY_TEXT_DOMAIN);
+    }
+
+    /**
+     * WooCommerce filter: never expose HTML or bank-logo markup when something
+     * reads `$order->get_payment_method_title()` (PDF invoices, emails, REST).
+     *
+     * @param string   $title Current stored title (may contain legacy HTML).
+     * @param WC_Order $order Order instance.
+     * @return string
+     */
+    public function filter_order_payment_method_title($title, $order)
+    {
+        if (!$order instanceof WC_Order || $order->get_payment_method() !== $this->id) {
+            return $title;
+        }
+        return $this->get_stored_payment_method_title();
+    }
+
+    /**
+     * Force-set the order's stored payment_method_title to plain text.
+     *
+     * `get_title()` returns rich HTML (bank-logo carousel + info bubble)
+     * because the classic checkout label needs it. WooCommerce, on
+     * checkout submission, copies whatever `get_title()` returns into
+     * `_payment_method_title` and that copy is what every downstream
+     * surface (admin orders, emails, PDF invoices, REST) renders. We
+     * always persist the canonical plain label ("Pay by Bank") so it
+     * matches invoices and is independent of the configurable checkout title.
+     *
+     * @param WC_Order $order
+     * @param array    $data Posted checkout data.
+     */
+    public function set_plain_payment_method_title($order, $data = array())
+    {
+        if (!$order instanceof WC_Order) {
+            return;
+        }
+        $method = isset($data['payment_method']) ? (string) $data['payment_method'] : $order->get_payment_method();
+        if ($method !== $this->id) {
+            return;
+        }
+        $order->set_payment_method_title($this->get_stored_payment_method_title());
+    }
+
+    /**
+     * Block-checkout / Store API variant — same intent as
+     * set_plain_payment_method_title() but runs from the
+     * `woocommerce_store_api_checkout_update_order_from_request` hook,
+     * which fires for the React-based block checkout instead of the
+     * classic POST flow.
+     */
+    public function set_plain_payment_method_title_from_request($order, $request)
+    {
+        if (!$order instanceof WC_Order) {
+            return;
+        }
+        if ($order->get_payment_method() !== $this->id) {
+            return;
+        }
+        $order->set_payment_method_title($this->get_stored_payment_method_title());
+    }
+
+    /**
+     * Sanitise the merchant-provided Title before it is persisted.
+     *
+     * Stops merchants from pasting HTML (e.g. bank-logo carousels copied
+     * from older docs) into the gateway title — that HTML would end up
+     * in `_payment_method_title` for new orders and in PDF invoice
+     * templates that don't escape gateway output.
+     */
+    public function validate_title_field($key, $value)
+    {
+        return wp_strip_all_tags((string) $value);
+    }
+
+    /**
+     * Sanitise the merchant-provided Description before it is persisted.
+     *
+     * PDF invoice templates routinely render the gateway description
+     * verbatim; HTML there blows up the layout (the original "giant bank
+     * logos taking up two pages" report).
+     */
+    public function validate_description_field($key, $value)
+    {
+        return wp_strip_all_tags((string) $value);
     }
 
     /**
