@@ -74,6 +74,20 @@
     margin: 0;
 }
 
+/* Keep bank carousel + info bubble on one row when the label wraps (narrow phones). */
+.wc_payment_method.payment_method_acountpay_payment .acountpay-payment-side,
+.wc-block-components-payment-method__label .acountpay-payment-side {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-shrink: 0;
+}
+
+.acountpay-payment-side .acountpay-bank-carousel,
+.acountpay-payment-side .acountpay-info-wrap {
+    margin-left: 0;
+}
+
 .wc_payment_method.payment_method_acountpay_payment input[type="radio"]:checked + label .acountpay-payment-title {
     color: #003a00;
 }
@@ -131,6 +145,15 @@
     gap: 0.75rem;
     padding: 1rem;
     cursor: pointer;
+}
+
+.wc-block-components-payment-method__label .acountpay-payment-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex: 1;
+    flex-wrap: wrap;
+    min-width: 0;
 }
 
 /* Bank logo carousel (classic + Blocks checkout) */
@@ -194,6 +217,9 @@
     background: transparent;
     color: #003a00;
     font: 600 12px/1 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-variant: normal;
+    text-transform: none;
+    letter-spacing: 0;
     cursor: pointer;
     padding: 0;
     display: inline-flex;
@@ -206,6 +232,13 @@
     background: #003a00;
     color: #fff;
     outline: none;
+}
+
+/* Win over theme/WooCommerce `button { text-transform: uppercase }` on checkout */
+.wc_payment_method.payment_method_acountpay_payment .acountpay-info-bubble,
+.wc-block-components-payment-method__label .acountpay-info-bubble {
+    text-transform: none;
+    font-variant: normal;
 }
 .acountpay-info-popover {
     position: absolute;

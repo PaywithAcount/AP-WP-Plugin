@@ -782,13 +782,14 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         $output = '<span class="acountpay-payment-label">'
             . '<span class="acountpay-payment-title">' . esc_html($plain_title) . '</span>';
 
-        $logos = $this->get_bank_logo_urls();
+        $extras = '';
+        $logos  = $this->get_bank_logo_urls();
         if (!empty($logos)) {
             $items = '';
             foreach (array_merge($logos, $logos) as $logo) {
                 $items .= '<img class="acountpay-bank-logo" src="' . esc_url($logo['url']) . '" alt="' . esc_attr($logo['name']) . '" loading="lazy" />';
             }
-            $output .= '<span class="acountpay-bank-carousel" aria-hidden="true">'
+            $extras .= '<span class="acountpay-bank-carousel" aria-hidden="true">'
                 . '<span class="acountpay-bank-carousel-track">' . $items . '</span>'
                 . '</span>';
         }
@@ -800,13 +801,17 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             foreach ($this->get_info_steps() as $step) {
                 $steps_html .= '<li>' . esc_html($step) . '</li>';
             }
-            $output .= '<span class="acountpay-info-wrap">'
+            $extras .= '<span class="acountpay-info-wrap">'
                 . '<button type="button" class="acountpay-info-bubble" aria-label="' . $aria_label . '" aria-expanded="false">i</button>'
                 . '<span class="acountpay-info-popover" role="tooltip">'
                     . '<strong>' . $heading . '</strong>'
                     . '<ol>' . $steps_html . '</ol>'
                 . '</span>'
                 . '</span>';
+        }
+
+        if ($extras !== '') {
+            $output .= '<span class="acountpay-payment-side">' . $extras . '</span>';
         }
 
         $output .= '</span>';
