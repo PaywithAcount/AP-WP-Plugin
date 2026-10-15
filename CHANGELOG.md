@@ -7,6 +7,25 @@ The plugin follows [Semantic Versioning](https://semver.org/) once it leaves
 2.x. Until then, the major number tracks the AcountPay payment-link API
 generation (v2 → 2.x).
 
+## 2.1.25 — 2026-10-15
+
+### Added
+
+- **Estonian banks.** *Bank countries* now includes Estonia. A merchant who
+  selects it sees the Estonian bank list (and CDN logos) from AcountPay and
+  can show those logos on checkout. Euro orders use the shopper's billing
+  country when that country is enabled and settles in euros: an Estonian
+  billing address gets Estonian banks, a Finnish address still gets Finnish
+  banks. A store that enables Estonia without Finland sends every other euro
+  order to Estonia. The default for new installs stays Finland + Denmark, so
+  existing stores do not offer Estonia until a merchant turns it on.
+
+### Notes
+
+- Estonia's banks come from AcountPay's `banks` table after the Token.io
+  catalogue sync for `EE`. Until that sync has run, the Estonia logo list is
+  empty. Refresh bank list once the backend has the rows.
+
 ## 2.1.8 — 2026-04-19
 
 ### Added

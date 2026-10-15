@@ -313,7 +313,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             $raw = array();
         }
 
-        $allowed = array('FI', 'DK');
+        $allowed = array('FI', 'DK', 'EE');
         $clean   = array();
         foreach ($raw as $code) {
             $code = strtoupper(substr((string) $code, 0, 2));
@@ -329,40 +329,81 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
      * payment. The POS bank selector is single-country (one flat list, or
      * the DK-specific Personal/Business tabs); when the merchant has
      * configured multiple countries in `bank_country` we pick the one that
-     * best matches the order currency, since Danish banks don't process EUR
-     * SEPA payments and Finnish banks don't process DKK.
+     * best matches this order, since Danish banks don't process EUR SEPA
+     * payments and Finnish or Estonian banks don't process DKK.
      *
      * Resolution order:
-     *   1. Currency mapping (EUR -> FI, DKK -> DK, SEK -> SE, etc.) when the
-     *      mapped country is in the merchant's configured list.
-     *   2. The first configured country.
-     *   3. 'DK' (preserves legacy default for stores upgrading from <2.1.10).
+     *   1. Billing country, when it is enabled and uses this order currency
+     *      (EE or FI for EUR, DK for DKK). An Estonian address on a store
+     *      that enabled Estonia gets Estonian banks even if Finland is also
+     *      enabled.
+     *   2. Currency mapping. EUR prefers Finland when enabled, otherwise
+     *      Estonia. DKK -> DK, SEK -> SE, NOK -> NO, when that country is
+     *      enabled. A Danish billing address on a euro order does not win
+     *      here — it falls through to the euro country.
+     *   3. The first configured country.
+     *   4. 'DK' (preserves legacy default for stores upgrading from <2.1.10).
      *
-     * @param string $currency ISO-4217 currency for this order.
+     * @param string $currency        ISO-4217 currency for this order.
+     * @param string $billing_country ISO-3166-1 alpha-2 billing country, if known.
      * @return string ISO-3166-1 alpha-2 country code.
      */
-    public function pick_pos_country_for_order($currency = '')
+    public function pick_pos_country_for_order($currency = '', $billing_country = '')
     {
         $configured = $this->get_bank_countries();
         $currency   = strtoupper((string) $currency);
+        $billing    = strtoupper(substr((string) $billing_country, 0, 2));
+
+        if (
+            $billing !== ''
+            && in_array($billing, $configured, true)
+            && $this->country_uses_currency($billing, $currency)
+        ) {
+            return $billing;
+        }
+
+        if ($currency === 'EUR') {
+            if (in_array('FI', $configured, true)) {
+                return 'FI';
+            }
+            if (in_array('EE', $configured, true)) {
+                return 'EE';
+            }
+        }
 
         $currency_to_country = array(
-            'EUR' => 'FI',
             'DKK' => 'DK',
             'SEK' => 'SE',
             'NOK' => 'NO',
         );
-        if (isset($currency_to_country[$currency])) {
-            $candidate = $currency_to_country[$currency];
-            if (in_array($candidate, $configured, true)) {
-                return $candidate;
-            }
+        if (isset($currency_to_country[$currency]) && in_array($currency_to_country[$currency], $configured, true)) {
+            return $currency_to_country[$currency];
         }
 
         if (!empty($configured)) {
             return $configured[0];
         }
         return 'DK';
+    }
+
+    /**
+     * Whether a bank-list country settles in this order currency.
+     *
+     * @param string $country  ISO-3166-1 alpha-2.
+     * @param string $currency ISO-4217.
+     * @return bool
+     */
+    private function country_uses_currency($country, $currency)
+    {
+        $map = array(
+            'FI' => 'EUR',
+            'EE' => 'EUR',
+            'DK' => 'DKK',
+            'SE' => 'SEK',
+            'NO' => 'NOK',
+            'GB' => 'GBP',
+        );
+        return isset($map[$country]) && $map[$country] === $currency;
     }
 
     /**
@@ -1133,12 +1174,13 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
                 'type'        => 'multiselect',
                 'class'       => 'wc-enhanced-select',
                 'css'         => 'min-width: 250px;',
-                'description' => __('Countries whose banks AcountPay should offer. Hold ⌘/Ctrl to pick more than one — useful for Nordic stores that accept both Finnish and Danish bank logins. Drives the live bank list (and CDN logos) used by the carousel below. Save the page after changing countries; the bank list refreshes automatically.', ACOUNTPAY_TEXT_DOMAIN),
+                'description' => __('Countries whose banks AcountPay should offer. Hold ⌘/Ctrl to pick more than one — useful for stores that accept Finnish, Danish, and Estonian bank logins. Drives the live bank list (and CDN logos) used by the carousel below. Save the page after changing countries; the bank list refreshes automatically.', ACOUNTPAY_TEXT_DOMAIN),
                 'default'     => array('FI', 'DK'),
                 'desc_tip'    => true,
                 'options'     => array(
                     'FI' => __('Finland', ACOUNTPAY_TEXT_DOMAIN),
                     'DK' => __('Denmark', ACOUNTPAY_TEXT_DOMAIN),
+                    'EE' => __('Estonia', ACOUNTPAY_TEXT_DOMAIN),
                 ),
             ],
             'bank_logos' => [
@@ -1720,7 +1762,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
             'description'        => sprintf(__('Payment for order #%s', ACOUNTPAY_TEXT_DOMAIN), $order->get_order_number()),
             'currency'           => $currency,
             'idempotencyKey'     => $idempotency_key,
-            'posBankCountryCode' => $this->pick_pos_country_for_order($currency),
+            'posBankCountryCode' => $this->pick_pos_country_for_order($currency, $order->get_billing_country()),
         );
 
         $this->log_info('receipt_page: Creating v2 payment link for retry', array('order_id' => $order_id));
@@ -1962,7 +2004,7 @@ class AcountPay_Payment_Gateway extends WC_Payment_Gateway_CC
         // back to merchant.posBankCountryCode (a per-merchant DB column that
         // defaults to 'DK'), so a Finnish-EUR store would always see Danish
         // banks on the POS even though the plugin is configured for FI.
-        $pos_country = $this->pick_pos_country_for_order($currency);
+        $pos_country = $this->pick_pos_country_for_order($currency, $order->get_billing_country());
 
         $payment_data = array(
             'clientId'           => $client_id,
